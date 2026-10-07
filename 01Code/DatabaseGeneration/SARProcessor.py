@@ -776,143 +776,227 @@ class SARProcessor:
 
     # def retrieve_stability_from_psd(self):
 
-    def wind_retrieval(self, tile, var_name='Sigma0_VV_no_targets', v_bounds=(0.5, 40.0),
-                   n_phi_starts=12, n_v_starts=3, work_in_log=True):
-        """
-        Retrieve wind speed and direction from SAR σ0 using CMOD5_N and least squares.
-        Assumes uniform wind over the tile (all pixels share v and phi_w, each with its own theta).
-
-        Params:
-        var_name : str
-            Name of the linear-scale σ0 variable in the tile (e.g. 'Sigma0_VV_no_targets').
-        v_bounds : tuple
-            (min, max) wind speed bounds [m/s] for the optimizer.
-        n_phi_starts : int
-            Number of initial azimuth guesses (grid over [0, 360)).
-        n_v_starts : int
-            Number of initial speed guesses per azimuth.
-        work_in_log : bool
-            If True, minimize residuals in log-space (recommended).
-
-        Returns:
-        v_ret : float
-            Retrieved wind speed [m/s].
-        phi_ret : float
-            Retrieved absolute wind direction [deg], in [0, 360).
-        """
+    def wind_retrieval(self,tile, lat, lon, var_name='Sigma0_VV_no_targets', v_bounds=(0.5, 40.0),
+        n_phi_starts=18, n_v_starts=4, work_in_logaritmic=True, wind_direction_convention='from', level=1):
         from scipy.optimize import least_squares
-        from scipy.ndimage import zoom
-        # ------------------------------------------------------------------
-        # 1. Gather σ0, incidence angle and platform heading
-        # ------------------------------------------------------------------
-        sigma0_arr = np.asarray(tile[var_name].values, dtype=np.float64)
-        ny, nx = sigma0_arr.shape
-        sigma0_arr = sigma0_arr.ravel()
+        from scipy.interpolate import RegularGridInterpolator
+        """
+        tile needed to retrieve sigma from var_name column and other values
+        var_name = Sigma0_VV_no_targets --> sigma filtered with no targets
+        v_bounds: limits for velocity
+        
+        """
+        # 1. Find the SAR pixel closest to the requested lat/lon
+        sigma0_da = tile[var_name]
+        if sigma0_da.ndim != 2:
+            raise ValueError(f"{var_name} must be 2-D. Got shape {sigma0_da.shape}")
 
-        theta_arr = np.asarray(tile['incident_angle'].values, dtype=np.float64)
-        if theta_arr.ndim == 2 and theta_arr.shape != (ny, nx):
-            # Interpolar tiepoint grid (tp_y, tp_x) → (ny, nx)
-            fy = ny / theta_arr.shape[0]
-            fx = nx / theta_arr.shape[1]
-            theta_arr = zoom(theta_arr, (fy, fx), order=1)   # bilineal
-            # Recortar por seguridad si zoom devuelve un píxel de más por redondeo
-            theta_arr = theta_arr[:ny, :nx]
-        theta_arr = theta_arr.ravel()
+        # SAR geographical coordinates
+        lat_da = tile['lat']
+        lon_da = tile['lon']
+        lat_array = np.asarray(lat_da.values, dtype=np.float64)
+        lon_array = np.asarray(lon_da.values, dtype=np.float64)
 
-        # Platform heading (scalar per product)
-        heading_arr = np.asarray(tile['platform_heading'].values).ravel()
-        platform_heading = float(heading_arr[0]) if heading_arr.size else np.nan
+        if lat_array.shape != sigma0_da.shape or lon_array.shape != sigma0_da.shape:
+            raise ValueError("lat/lon and sigma0 must have the same spatial shape.")
 
-        # ------------------------------------------------------------------
-        # 2. Mask invalid pixels
-        # ------------------------------------------------------------------
-        valid = (np.isfinite(sigma0_arr) & np.isfinite(theta_arr)
-                & (sigma0_arr > 0.0) & (theta_arr > 0.0))
+        # Find closest pixel
+        distance2 = (lat_array - lat)**2 + (lon_array - lon)**2
 
-        sigma0_v = sigma0_arr[valid]
-        theta_v  = theta_arr[valid]
+        # Ignore invalid coordinates
+        distance2[~np.isfinite(lat_array) | ~np.isfinite(lon_array)] = np.inf
+        y_idx, x_idx = np.unravel_index(np.argmin(distance2), distance2.shape)
 
-        if sigma0_v.size < 10 or not np.isfinite(platform_heading):
-            print("wind_retrieval: not enough valid pixels or missing platform heading.")
-            self.retrieved_wind_speed = np.nan
-            self.retrieved_wind_direction = np.nan
-            return np.nan, np.nan
+        # ---------------------------------------------
+        # Window around FINO1
+        # level=1 -> 3x3
+        # level=2 -> 5x5
+        # level=3 -> 7x7
+        # ---------------------------------------------
 
-        # ------------------------------------------------------------------
-        # 3. Antenna look azimuth (Sentinel-1 right-looking => heading + 90°)
-        # ------------------------------------------------------------------
-        look_azimuth = (platform_heading + 90.0) % 360.0
+        if level < 1:
+            raise ValueError("level must be >= 1")
 
-        # Pre-compute observed log-σ0 for residuals
-        log_sigma0_obs = np.log(sigma0_v)
+        y_min = y_idx - level
+        y_max = y_idx + level + 1
+        x_min = x_idx - level
+        x_max = x_idx + level + 1
+        ny, nx = sigma0_da.shape
+        y_min = max(0, y_min)
+        y_max = min(ny, y_max)
+        x_min = max(0, x_min)
+        x_max = min(nx, x_max)
 
-        # ------------------------------------------------------------------
-        # 4. Residual function: params = [v, phi_wind_absolute]
-        # ------------------------------------------------------------------
+        if y_min < 0 or y_max > ny or x_min < 0 or x_max > nx:
+            raise ValueError(
+                f"Window level={level} around pixel ({y_idx}, {x_idx}) "
+                f"falls outside the SAR image."
+            )
+
+        sigma0_window = np.asarray(sigma0_da.values[y_min:y_max, x_min:x_max],dtype=np.float64)
+
+        print("=================================")
+        print("Wind retrieval window")
+        print("level =", level)
+        print("window shape =", sigma0_window.shape)
+        print("center pixel =", (y_idx, x_idx))
+        print("=================================")
+        
+        # 2. Get incidence angle at the same position
+        theta_da = tile['incident_angle']
+        theta_tp = np.asarray(theta_da.values, dtype=np.float64)
+        if theta_tp.ndim != 2:
+            raise ValueError("incident_angle must be a 2-D tie-point grid.")
+        tp_ny, tp_nx = theta_tp.shape
+
+        if (tp_ny, tp_nx) != (11, 11):
+            print(f"Warning: expected an 11x11 incidence-angle grid, got {theta_tp.shape}")
+
+        # Coordinates of the tie-point grid in pixel coordinates
+        ny, nx = sigma0_da.shape
+        tp_y = np.linspace(0.0, ny - 1.0, tp_ny)
+        tp_x = np.linspace(0.0, nx - 1.0, tp_nx)
+
+        interpolator = RegularGridInterpolator((tp_y, tp_x), theta_tp, method='linear', bounds_error=False, fill_value=None)
+        
+        # Pixel coordinates of the window
+        window_y, window_x = np.meshgrid(np.arange(y_min, y_max), np.arange(x_min, x_max), indexing='ij')
+        points = np.column_stack([window_y.ravel(), window_x.ravel()])
+        theta_window = interpolator(points).reshape(sigma0_window.shape)
+        print("theta_window shape =", theta_window.shape)
+
+        # 3. Platform heading (satellite fligh heading)
+        heading_raw = tile['platform_heading'].values
+
+        try:
+            platform_heading = float(np.asarray(heading_raw).item())
+        except (TypeError, ValueError):
+            raise ValueError(f"Could not convert platform_heading={heading_raw!r} to float.")
+
+        # Normalize to [0, 360)
+        platform_heading %= 360.0
+
+        # Sentinel-1 is not right-looking.
+        # For a right-looking SAR --> look azimuth = platform heading + 90° # TODO
+        look_azimuth = platform_heading % 360.0
+        print("look_azimuth 00: ", look_azimuth)
+
+        # 5. Observed sigma0 #TODO
+        if work_in_logaritmic:
+            log_sigma0_obs = np.log(np.maximum(sigma0_window, 1e-12))
+
+        # 6. Wind direction convention
+        if wind_direction_convention not in ('from', 'to'):
+            raise ValueError("wind_direction_convention must be 'from' or 'to'.")
+        
+        #Flat values for residuals
+        sigma0_flat = sigma0_window.ravel()
+        theta_flat = theta_window.ravel()
+        
+        valid_mask = (np.isfinite(sigma0_flat) & np.isfinite(theta_flat) & (sigma0_flat > 0))
+        sigma0_flat = sigma0_flat[valid_mask]
+        theta_flat = theta_flat[valid_mask]
+
+        if sigma0_flat.size < 3:
+            raise ValueError(f"Only {sigma0_flat.size} valid pixels in level={level} window.")
+
+        # 7. CMOD5-N residual function
         def residuals(params):
-            v, phi_wind = params
-
-            # Relative angle wind-to-look, wrapped to [-180, 180]
-            phi_rel = (phi_wind - look_azimuth + 180.0) % 360.0 - 180.0
-
-            # CMOD5_N is symmetric in ±phi: use absolute value
-            sigma0_pred = self.calc_sigma0_cmod5_n(v, np.abs(phi_rel), theta_v)
-
-            # Guard against invalid predictions
-            sigma0_pred = np.where(np.isfinite(sigma0_pred) & (sigma0_pred > 0),
-                                sigma0_pred, 1e-12)
-
-            if work_in_log:
-                return np.log(sigma0_pred) - log_sigma0_obs
+            v, wind_direction = params
+            if wind_direction_convention == 'from':
+                wind_to = (wind_direction + 180.0) % 360.0 # Normalize direction.
             else:
-                return sigma0_pred - sigma0_v
+                wind_to = wind_direction % 360.0 # Normalize direction.
 
-        # ------------------------------------------------------------------
-        # 5. Multi-start least squares (handles 180° ambiguity + local minima)
-        # ------------------------------------------------------------------
+            phi_rel = (wind_to - look_azimuth) # relative angle between wind direction and satellite heading
+
+            phi_rel = (phi_rel + 180.0) % 360.0 - 180.0 # [-180°, 180°) TODO: why?
+
+            # CMOD5-N
+
+            sigma0_pred = self.calc_sigma0_cmod5_n(v, phi_rel, theta_flat) #Using empirical equation
+
+            # Guard against numerical problems.
+            sigma0_pred = np.asarray(sigma0_pred, dtype=np.float64)
+
+            sigma0_pred = np.maximum(sigma0_pred, 1e-12)
+
+            if work_in_logaritmic:
+                log_res = np.log(sigma0_pred) - log_sigma0_obs.ravel()
+                return log_res
+
+            else:
+                res = sigma0_pred - sigma0_flat
+                return res
+        
+        # 8. Multi-start optimization
         phi_grid = np.linspace(0.0, 360.0, n_phi_starts, endpoint=False)
-        v_grid   = np.linspace(v_bounds[0] + 0.5, v_bounds[1] - 0.5, n_v_starts)
+
+        v_min, v_max = v_bounds
+
+        v_grid = np.linspace(v_min, v_max, n_v_starts)
 
         best_result = None
-        best_cost   = np.inf
-
+        best_cost = np.inf
+        all_results = dict()
+        iteration = 0
         for phi0 in phi_grid:
             for v0 in v_grid:
                 try:
-                    res = least_squares(
+                    result = least_squares(
                         residuals,
                         x0=[v0, phi0],
-                        bounds=([v_bounds[0], 0.0], [v_bounds[1], 360.0]),
+                        bounds=([v_min, 0.0], [v_max, 360.0]),
                         method='trf',
-                        max_nfev=200,
+                        max_nfev=300,
                     )
-                    if res.cost < best_cost:
-                        best_cost   = res.cost
-                        best_result = res
+
+                    # Guardar resultado de esta iteración
+                    if result.success and np.isfinite(result.cost):
+                        v_ret = float(result.x[0])
+                        phi_ret = float(result.x[1] % 360.0)
+
+                        all_results[iteration] = {
+                            # 'result': result,
+                            'phi0': float(phi0),
+                            'v0': float(v0),
+                            'v_ret': v_ret,
+                            'phi_ret': phi_ret,
+                            'cost': float(result.cost),
+                        }
+
+                        # Actualizar mejor resultado
+                        if result.cost < best_cost:
+                            best_cost = result.cost
+                            best_result = result
+
+                        iteration += 1
+
                 except Exception:
                     continue
-
+                
+        # 9. Check optimization
         if best_result is None:
-            print("wind_retrieval: all least-squares attempts failed.")
+            print( "wind_retrieval: all optimization attempts failed.")
             self.retrieved_wind_speed = np.nan
             self.retrieved_wind_direction = np.nan
-            return np.nan, np.nan
+            return np.nan, np.nan, tile, all_results
 
-        v_ret, phi_ret = best_result.x
-        phi_ret = phi_ret % 360.0  # → [0, 360)
+        # 10. Retrieve solution
+        v_ret = float(best_result.x[0])
+        phi_ret = float(best_result.x[1] % 360.0)
 
-        # ------------------------------------------------------------------
-        # 6. Store results on object and tile
-        # ------------------------------------------------------------------
-        self.retrieved_wind_speed     = float(v_ret)
-        self.retrieved_wind_direction = float(phi_ret)
-
-        tile['retrieved_wind_speed']     = float(v_ret)
-        tile['retrieved_wind_direction'] = float(phi_ret)
-        tile['wind_retrieval_cost']      = float(best_cost)
-        tile['wind_retrieval_n_pixels']  = int(sigma0_v.size)
-
-        return v_ret, phi_ret, tile
+        # 11. Store results
+        self.retrieved_wind_speed = v_ret
+        self.retrieved_wind_direction = phi_ret
+        tile['retrieved_wind_speed'] = v_ret
+        tile['retrieved_wind_direction'] = phi_ret
+        tile['wind_retrieval_cost'] = float(best_cost)
+        # tile['wind_retrieval_n_pixels'] = int(sigma0.size)
+        tile['platform_heading_used'] = float(platform_heading)
+        tile['radar_look_azimuth_used'] = float(look_azimuth)
+        self.tile = tile
+        return v_ret, phi_ret, tile, all_results
 
     ########### HELP: functions that can be used ################
     def calc_sigma0_cmod5_n(self, v, phi, theta):
