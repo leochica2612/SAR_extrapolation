@@ -10,6 +10,12 @@ import glob
 import pickle
 import numpy as np
 from .configManager import Config
+
+from scipy.optimize import least_squares
+from scipy.interpolate import RegularGridInterpolator
+from .algorithms.cmod5_n import calc_sigma0_cmod5_n
+from .algorithms.wind_profile import diabatic_wind_profile
+
 # SAR file processor class
 """
     This class extracts useful information from pre-processed L-1 SLC Sentinel-1 AB data.
@@ -777,9 +783,7 @@ class SARProcessor:
     # def retrieve_stability_from_psd(self):
 
     def wind_retrieval(self,tile, lat, lon, var_name='Sigma0_VV_no_targets', v_bounds=(0.5, 40.0),
-        n_phi_starts=18, n_v_starts=4, work_in_logaritmic=True, wind_direction_convention='from', level=1):
-        from scipy.optimize import least_squares
-        from scipy.interpolate import RegularGridInterpolator
+        wdir=180, n_v_starts=4, wind_direction_convention='from', level=1):
         """
         tile needed to retrieve sigma from var_name column and other values
         var_name = Sigma0_VV_no_targets --> sigma filtered with no targets
@@ -881,11 +885,7 @@ class SARProcessor:
         look_azimuth = platform_heading % 360.0
         print("look_azimuth 00: ", look_azimuth)
 
-        # 5. Observed sigma0 #TODO
-        if work_in_logaritmic:
-            log_sigma0_obs = np.log(np.maximum(sigma0_window, 1e-12))
-
-        # 6. Wind direction convention
+        # 5. Wind direction convention
         if wind_direction_convention not in ('from', 'to'):
             raise ValueError("wind_direction_convention must be 'from' or 'to'.")
         
@@ -900,38 +900,29 @@ class SARProcessor:
         if sigma0_flat.size < 3:
             raise ValueError(f"Only {sigma0_flat.size} valid pixels in level={level} window.")
 
-        # 7. CMOD5-N residual function
+        # 6. CMOD5-N residual function
         def residuals(params):
-            v, wind_direction = params
+            v = float(params[0])
             if wind_direction_convention == 'from':
-                wind_to = (wind_direction + 180.0) % 360.0 # Normalize direction.
+                wind_to = (wdir + 180.0) % 360.0 # Normalize direction.
             else:
-                wind_to = wind_direction % 360.0 # Normalize direction.
+                wind_to = wdir % 360.0 # Normalize direction.
 
             phi_rel = (wind_to - look_azimuth) # relative angle between wind direction and satellite heading
 
             phi_rel = (phi_rel + 180.0) % 360.0 - 180.0 # [-180°, 180°) TODO: why?
 
             # CMOD5-N
-
-            sigma0_pred = self.calc_sigma0_cmod5_n(v, phi_rel, theta_flat) #Using empirical equation
-
+            sigma0_pred = calc_sigma0_cmod5_n(v, phi_rel, theta_flat) #Using empirical equation
             # Guard against numerical problems.
             sigma0_pred = np.asarray(sigma0_pred, dtype=np.float64)
 
             sigma0_pred = np.maximum(sigma0_pred, 1e-12)
 
-            if work_in_logaritmic:
-                log_res = np.log(sigma0_pred) - log_sigma0_obs.ravel()
-                return log_res
-
-            else:
-                res = sigma0_pred - sigma0_flat
-                return res
+            res = sigma0_pred - sigma0_flat
+            return res
         
         # 8. Multi-start optimization
-        phi_grid = np.linspace(0.0, 360.0, n_phi_starts, endpoint=False)
-
         v_min, v_max = v_bounds
 
         v_grid = np.linspace(v_min, v_max, n_v_starts)
@@ -940,177 +931,256 @@ class SARProcessor:
         best_cost = np.inf
         all_results = dict()
         iteration = 0
-        for phi0 in phi_grid:
-            for v0 in v_grid:
-                try:
-                    result = least_squares(
-                        residuals,
-                        x0=[v0, phi0],
-                        bounds=([v_min, 0.0], [v_max, 360.0]),
-                        method='trf',
-                        max_nfev=300,
-                    )
+        for v0 in v_grid:
+            try:
+                result = least_squares(
+                    residuals,
+                    x0=[v0],
+                    bounds=([v_min], [v_max]),
+                    method='trf',
+                    max_nfev=300,
+                )
 
-                    # Guardar resultado de esta iteración
-                    if result.success and np.isfinite(result.cost):
-                        v_ret = float(result.x[0])
-                        phi_ret = float(result.x[1] % 360.0)
+                if result.success and np.isfinite(result.cost):
+                    v_ret = float(result.x[0])
+                    # phi_ret = float(result.x[1] % 360.0)
 
-                        all_results[iteration] = {
-                            # 'result': result,
-                            'phi0': float(phi0),
-                            'v0': float(v0),
-                            'v_ret': v_ret,
-                            'phi_ret': phi_ret,
-                            'cost': float(result.cost),
-                        }
+                    all_results[iteration] = {
+                        # 'result': result,
+                        'phi0': float(wdir),
+                        'v0': float(v0),
+                        'v_ret': v_ret,
+                        'cost': float(result.cost),
+                    }
 
-                        # Actualizar mejor resultado
-                        if result.cost < best_cost:
-                            best_cost = result.cost
-                            best_result = result
+                    if result.cost < best_cost:
+                        best_cost = result.cost
+                        best_result = result
 
-                        iteration += 1
+                    iteration += 1
 
-                except Exception:
-                    continue
+            except Exception as exc:
+                print(f"Error para v0={v0}: {type(exc).__name__}: {exc}")
+                continue
                 
-        # 9. Check optimization
+        # 8. Check optimization
         if best_result is None:
             print( "wind_retrieval: all optimization attempts failed.")
             self.retrieved_wind_speed = np.nan
-            self.retrieved_wind_direction = np.nan
-            return np.nan, np.nan, tile, all_results
+            return np.nan, tile, all_results
 
-        # 10. Retrieve solution
+        # 9. Retrieve solution
         v_ret = float(best_result.x[0])
-        phi_ret = float(best_result.x[1] % 360.0)
+        # phi_ret = float(best_result.x[1] % 360.0)
 
-        # 11. Store results
+        # 10. Store results
         self.retrieved_wind_speed = v_ret
-        self.retrieved_wind_direction = phi_ret
         tile['retrieved_wind_speed'] = v_ret
-        tile['retrieved_wind_direction'] = phi_ret
         tile['wind_retrieval_cost'] = float(best_cost)
-        # tile['wind_retrieval_n_pixels'] = int(sigma0.size)
         tile['platform_heading_used'] = float(platform_heading)
         tile['radar_look_azimuth_used'] = float(look_azimuth)
         self.tile = tile
-        return v_ret, phi_ret, tile, all_results
+        return v_ret, tile, all_results
 
-    ########### HELP: functions that can be used ################
-    def calc_sigma0_cmod5_n(self, v, phi, theta):
-        """Calculates CMOD5n normalized radar backscatter (linear).
+    
 
-        Parameters:
-            v: Wind speed [m/s] (>= 0)
-            phi: Relative wind direction [deg] (angle between azimuth and wind
-            direction)
-            theta: Incidence angle [deg]
+    def retrieve_wind_profile_parameters(self, wind_speeds, heights, weights,
+        L_bounds=(-1000.0, -1.0), u_star_bounds=(0.01, 2.0),
+        n_starts=5, stability="u",
+        L_prior=None, sigma_logL=2.5
+    ):
 
-        Returns:
-            CMOD5_N: Normalized backscatter sigma0 (linear scale)
-        """
+        # 1. Convert inputs to arrays
+        wind_speeds = np.asarray(wind_speeds, dtype=float).ravel()
+        heights = np.asarray(heights, dtype=float).ravel()
+        # Checks
+        if wind_speeds.size != heights.size: raise ValueError("wind_speeds and heights must have the same length.")
+        if wind_speeds.size < 3: raise ValueError("At least 3 measurements are required for this fit.")
+        if not np.all(np.isfinite(wind_speeds)): raise ValueError("wind_speeds must contain finite values.")
+        if not np.all(np.isfinite(heights)) or np.any(heights <= 0): raise ValueError("heights must be finite and positive.")
+        if np.any(wind_speeds < 0): raise ValueError("wind_speeds cannot be negative.")
+        if not isinstance(n_starts, (int, np.integer)) or n_starts < 1: raise ValueError("n_starts must be an integer >= 1.")
+        
+        if weights is None:
+            weights = np.ones_like(wind_speeds)
 
-        # 1-based indexing added to match Fortran C(1) .. C(28)
-        C = np.array(
-            [
-                0.0,  # Index 0 unused to maintain 1-based Fortran indexing
-                -0.6878,
-                -0.7957,
-                0.3380,
-                -0.1728,
-                0.0000,
-                0.0040,
-                0.1103,
-                0.0159,
-                6.7329,
-                2.7713,
-                -2.2885,
-                0.4971,
-                -0.7250,
-                0.0450,
-                0.0066,
-                0.3222,
-                0.0120,
-                22.7000,
-                2.0813,
-                3.0000,
-                8.3659,
-                -3.3428,
-                1.3236,
-                6.2437,
-                2.3893,
-                0.3249,
-                4.1590,
-                1.6930,
-            ]
-        )
+        # 2. Normalize stability convention MAP
+        stability_map = { 0: "u", 1: "n", 2: "n", 3: "s", 
+                         "u": "u", "nn": "n", "np": "n", "s": "s"}
 
-        DTOR = 57.29577951
-        THETM = 40.0
-        THETHR = 25.0
-        ZPOW = 1.6
+        try: stability = stability_map[stability]
+        except (KeyError, TypeError): raise ValueError("stability must be 0/'u', 1/'n', or 2/'s'.")
 
-        Y0 = C[19]
-        PN = C[20]
-        A = C[19] - (C[19] - 1.0) / C[20]
-        B = 1.0 / (C[20] * (C[19] - 1.0) ** (3 - 1))
+        # 3. Validate friction velocity bounds
+        u_min, u_max = map(float, u_star_bounds)
+        if not (0 < u_min < u_max < np.inf): raise ValueError("u_star_bounds must satisfy 0 < lower < upper < infinity.")
 
-        # Angles
-        FI = np.radians(phi)  # equivalent to phi / DTOR
-        CSFI = np.cos(FI)
-        CS2FI = 2.0 * CSFI * CSFI - 1.0
+        # 4. Validate Obukhov length bounds
+        L_min, L_max = map(float, L_bounds)
+        if L_prior is None:
+            L_prior = abs(L_min if stability=="u" else L_max) * 0.1
+        # 5. Define residual function
+        def residuals(params):
+            u_star, L = params
+            wind_pred = diabatic_wind_profile(heights, u_star, L, stability)
+            r_data = np.sqrt(weights) * (wind_pred - wind_speeds)
+            r_prior = (np.log(abs(L)) - np.log(L_prior)) / sigma_logL # regularización bayesiana
+            return np.concatenate([r_data, [r_prior]])
 
-        X = (theta - THETM) / THETHR
-        XX = X * X
+        # # 6. Neutral case: L is not estimated
+        # if stability == "n":
+        #     u_grid = np.linspace(u_min, u_max, n_starts)
 
-        # B0: Function of wind speed and incidence angle
-        A0 = C[1] + C[2] * X + C[3] * XX + C[4] * X * XX
-        A1 = C[5] + C[6] * X
-        A2 = C[7] + C[8] * X
+        #     best_result = None
+        #     best_cost = np.inf
+        #     all_results = {}
 
-        GAM = C[9] + C[10] * X + C[11] * XX
-        S0 = C[12] + C[13] * X
+        #     for i, u0 in enumerate(u_grid):
+        #         result = least_squares(
+        #             residuals,
+        #             x0=[u0],
+        #             bounds=([u_min], [u_max]),
+        #             method="trf",
+        #             max_nfev=300,
+        #         )
 
-        S = A2 * v
-        A3 = 1.0 / (1.0 + np.exp(-np.maximum(S, S0)))
+        #         all_results[i] = {
+        #             "u_star_0": float(u0),
+        #             "u_star_ret": float(result.x[0]),
+        #             "cost": float(result.cost),
+        #             "success": bool(result.success),
+        #         }
 
-        # Piecewise condition for S < S0
-        if np.ndim(S) > 0:
-            mask = S < S0
-            A3[mask] = A3[mask] * (S[mask] / S0[mask]) ** (
-                S0[mask] * (1.0 - A3[mask])
-            )
-        else:
-            if S < S0:
-                A3 = A3 * (S / S0) ** (S0 * (1.0 - A3))
+        #         if result.success and np.isfinite(result.cost):
+        #             if result.cost < best_cost:
+        #                 best_cost = float(result.cost)
+        #                 best_result = result
 
-        B0 = (A3**GAM) * (10.0 ** (A0 + A1 * v))
+        #     if best_result is None:
+        #         raise RuntimeError("All neutral optimization attempts failed.")
 
-        # B1: Function of wind speed and incidence angle
-        B1 = C[15] * v * (0.5 + X - np.tanh(4.0 * (X + C[16] + C[17] * v)))
-        B1 = C[14] * (1.0 + X) - B1
-        B1 = B1 / (np.exp(0.34 * (v - C[18])) + 1.0)
+        #     return np.inf, float(best_result.x[0]), {
+        #         "cost": best_cost,
+        #         "success": bool(best_result.success),
+        #         "optimality": float(best_result.optimality),
+        #         "nfev": int(best_result.nfev),
+        #         "stability": stability,
+        #     }, all_results
 
-        # B2: Function of wind speed and incidence angle
-        V0 = C[21] + C[22] * X + C[23] * XX
-        D1 = C[24] + C[25] * X + C[26] * XX
-        D2 = C[27] + C[28] * X
+        if not (np.isfinite(L_min) and np.isfinite(L_max) and L_min < L_max): raise ValueError("L_bounds must be finite and lower < upper.")
 
-        V2 = (v / V0) + 1.0
+        if stability == "u" and not (L_min < L_max < 0): raise ValueError("For unstable conditions, L_bounds must be negative.")
+        if stability == "s" and not (0 < L_min < L_max): raise ValueError("For stable conditions, L_bounds must be positive.")
 
-        # Piecewise condition for V2 < Y0
-        if np.ndim(V2) > 0:
-            mask2 = V2 < Y0
-            V2[mask2] = A + B * (V2[mask2] - 1.0) ** PN
-        else:
-            if V2 < Y0:
-                V2 = A + B * (V2 - 1.0) ** PN
+        # 7. Multi-start optimization
+        u_grid = np.linspace(u_min, u_max, n_starts)
+        L_grid = np.linspace(L_min, L_max, n_starts)
 
-        B2 = (-D1 + D2 * V2) * np.exp(-V2)
+        best_result = None
+        best_cost = np.inf
+        all_results = {}
+        # total_iterations = len(u_grid) * len(L_grid)
+        i = 0
+        for u0 in u_grid:
+            for L0 in L_grid:
+        # for i, (u0, L0) in enumerate(zip(u_grid, L_grid)):
+                try:
+                    result = least_squares(
+                        residuals,
+                        x0=[u0, L0],
+                        bounds=(
+                            [u_min, L_min],
+                            [u_max, L_max],
+                        ),
+                        method="trf",
+                        x_scale=[0.1, max(1.0, abs(L0))],
+                        max_nfev=1000,
+                    )
 
-        # CMOD5_N: Combine the three Fourier terms
-        CMOD5_N = B0 * (1.0 + B1 * CSFI + B2 * CS2FI) ** ZPOW
+                    all_results[i] = {
+                        "u_star_0": float(u0),
+                        "L_0": float(L0),
+                        "u_star_ret": float(result.x[0]),
+                        "L_ret": float(result.x[1]),
+                        "cost": float(result.cost),
+                        "success": bool(result.success),
+                    }
+                    i += 1
 
-        return CMOD5_N
+                    if np.isfinite(result.cost) and result.cost < best_cost: # result.success:
+                        # if result.cost < best_cost:
+                        best_cost = float(result.cost)
+                        best_result = result
+
+                except (ValueError, FloatingPointError) as exc:
+                    all_results[i] = {
+                        "u_star_0": float(u0),
+                        "L_0": float(L0),
+                        "error": str(exc),
+                    }
+                    i += 1
+
+        if best_result is None:
+            raise RuntimeError("All optimization attempts failed.")
+        
+        u_star_ret = float(best_result.x[0])
+        L_ret = float(best_result.x[1])
+
+        best_info = {
+            "cost": best_cost,
+            "success": bool(best_result.success),
+            "optimality": float(best_result.optimality),
+            "nfev": int(best_result.nfev),
+            "stability": stability,
+        }
+
+        return L_ret, u_star_ret, best_info, all_results
+
+    def retrieve_wind_profile_parameters_all_stability(
+        self,
+        wind_speeds,
+        heights,
+        weights=None,
+        L_bounds_unstable=(-500.0, -10.0),
+        L_bounds_stable=(10.0, 500.0),
+        u_star_bounds=(0.01, 2.0),
+        n_starts=5,
+    ):
+        # (stability, L_bounds) pairs. L_bounds is ignored for neutral.
+        fits = [
+            ("u", L_bounds_unstable),
+            ("nn", (-1000.0, -500.0)),
+            ("np", (500.0, 1000.0)),
+            ("s", L_bounds_stable),
+        ]
+
+        results = {}
+
+        for stability, L_bounds in fits:
+            try:
+                L_ret, u_star_ret, best_info, _ = self.retrieve_wind_profile_parameters(
+                    wind_speeds=wind_speeds,
+                    heights=heights,
+                    weights=weights,
+                    L_bounds=L_bounds,
+                    u_star_bounds=u_star_bounds,
+                    n_starts=n_starts,
+                    stability=stability,
+                )
+                results[stability] = {
+                    "L": float(L_ret),
+                    "u_star": float(u_star_ret),
+                    "cost": float(best_info["cost"]),
+                    "success": bool(best_info["success"]),
+                }
+            except (RuntimeError, ValueError) as exc:
+                # One stability failed -> keep the other two usable.
+                results[stability] = {
+                    "L": np.inf if stability == "n" else np.nan,
+                    "u_star": np.nan,
+                    "cost": np.nan,
+                    "success": False,
+                    "error": str(exc),
+                }
+
+        return results

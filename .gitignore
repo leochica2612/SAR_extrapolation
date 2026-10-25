@@ -39,13 +39,17 @@ Thumbs.db
 # PARTICULAR FILES #
 ###################
 01Code/download_SLC_data.py
-01Code/download_SLC_data.ipynb
 01Code/__pycache__/
-01Code/test.ipynb
-01Code/test_SAR_process.ipynb
 01Code/token
 01Code/FINO1_2016_2020_processed.pkl
-01Code/test_sarprocessor.ipynb
 01Code/DatabaseGeneration/config.py
 01Code/config.txt
 venv_leo
+
+# TFM #
+###################
+01Code/*.ipynb
+01Code/*.xlsx
+01Code/TFM_utils/__pycache__/
+01Code/DatabaseGeneration/__pycache__/
+01Code/DatabaseGeneration/algorithms/__pycache__/
