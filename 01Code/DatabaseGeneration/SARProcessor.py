@@ -9,12 +9,13 @@ from scipy.ndimage import uniform_filter, maximum_filter
 import glob
 import pickle
 import numpy as np
+from itertools import combinations
 from .configManager import Config
 
 from scipy.optimize import least_squares
 from scipy.interpolate import RegularGridInterpolator
 from .algorithms.cmod5_n import calc_sigma0_cmod5_n
-from .algorithms.wind_profile import diabatic_wind_profile
+from .algorithms.wind_profile import diabatic_wind_profile, delta_diabatic_wind_profile
 
 # SAR file processor class
 """
@@ -782,44 +783,41 @@ class SARProcessor:
 
     # def retrieve_stability_from_psd(self):
 
-    def wind_retrieval(self,tile, lat, lon, var_name='Sigma0_VV_no_targets', v_bounds=(0.5, 40.0),
-        wdir=180, n_v_starts=4, wind_direction_convention='from', level=1):
-        """
-        tile needed to retrieve sigma from var_name column and other values
-        var_name = Sigma0_VV_no_targets --> sigma filtered with no targets
-        v_bounds: limits for velocity
-        
-        """
+    def wind_retrieval(self,tile, lat:float, lon:float , var_name='Sigma0_VV_no_targets', v_bounds = (0.5, 40.0),
+        wdir:float = 180.0, n_v_starts: int = 4, wind_direction_convention='from', level:int = 1, 
+        weighting: str = None, gaussian_sigma_m: float = 100.0):
+        # weigthing: None | "uniform" | "gaussian" | "inverse_distance2"
+        R = 6_371_000.0  # Earth radius in meters
         # 1. Find the SAR pixel closest to the requested lat/lon
-        sigma0_da = tile[var_name]
-        if sigma0_da.ndim != 2:
-            raise ValueError(f"{var_name} must be 2-D. Got shape {sigma0_da.shape}")
+        sigma0_da = tile[var_name] # Sigma0_VV_no_targets is  filtered tile with no obstacles
+        if sigma0_da.ndim != 2: raise ValueError(f"{var_name} must be 2-D. Got shape {sigma0_da.shape}")
 
         # SAR geographical coordinates
+        # Retrieve lat and lon for each SAR pixel a put in an array
         lat_da = tile['lat']
         lon_da = tile['lon']
         lat_array = np.asarray(lat_da.values, dtype=np.float64)
         lon_array = np.asarray(lon_da.values, dtype=np.float64)
-
-        if lat_array.shape != sigma0_da.shape or lon_array.shape != sigma0_da.shape:
-            raise ValueError("lat/lon and sigma0 must have the same spatial shape.")
+        if lat_array.shape != sigma0_da.shape or lon_array.shape != sigma0_da.shape: raise ValueError("lat/lon and sigma0 must have the same spatial shape.")
 
         # Find closest pixel
-        distance2 = (lat_array - lat)**2 + (lon_array - lon)**2
-
-        # Ignore invalid coordinates
-        distance2[~np.isfinite(lat_array) | ~np.isfinite(lon_array)] = np.inf
+        lat0_rad = np.deg2rad(lat)
+        dx = R * np.cos(lat0_rad) * np.deg2rad(lon_array - lon)
+        dy = R * np.deg2rad(lat_array - lat)
+        distance2_m = dx**2 + dy**2
+        invalid = ~np.isfinite(lat_array) | ~np.isfinite(lon_array)
+        distance2_m[invalid] = np.inf
+        # distance2 = (lat_array - lat)**2 + (lon_array - lon)**2 # TODO: here we already have the distance to each pixel respecto to FINO1
+        distance2 = distance2_m
         y_idx, x_idx = np.unravel_index(np.argmin(distance2), distance2.shape)
 
         # ---------------------------------------------
         # Window around FINO1
         # level=1 -> 3x3
-        # level=2 -> 5x5
-        # level=3 -> 7x7
+        # level=N -> (2*level+1)^2
         # ---------------------------------------------
 
-        if level < 1:
-            raise ValueError("level must be >= 1")
+        if level < 1: raise ValueError("level must be >= 1")
 
         y_min = y_idx - level
         y_max = y_idx + level + 1
@@ -831,20 +829,46 @@ class SARProcessor:
         x_min = max(0, x_min)
         x_max = min(nx, x_max)
 
-        if y_min < 0 or y_max > ny or x_min < 0 or x_max > nx:
-            raise ValueError(
-                f"Window level={level} around pixel ({y_idx}, {x_idx}) "
-                f"falls outside the SAR image."
-            )
+        if y_min < 0 or y_max > ny or x_min < 0 or x_max > nx: raise ValueError(f"Window level={level} around pixel ({y_idx}, {x_idx}) falls outside the SAR image.")
 
         sigma0_window = np.asarray(sigma0_da.values[y_min:y_max, x_min:x_max],dtype=np.float64)
+        # ---------------------------------------------
+        # Distance-based weights
+        # ---------------------------------------------
+        distance2_window = distance2[y_min:y_max, x_min:x_max]
+        valid = (np.isfinite(distance2_window) & np.isfinite(sigma0_window))
+
+        if weighting is None:
+            # No weighting: ordinary least squares
+            weights_window = np.ones_like(sigma0_window, dtype=np.float64)
+
+        elif weighting == "uniform":
+            # Flat distribution, normalized to sum to 1
+            weights_window = valid.astype(np.float64)
+            weight_sum = weights_window.sum()
+            if weight_sum == 0: raise ValueError("No valid pixels available.")
+            weights_window /= weight_sum
+        elif weighting == "inverse_distance2":
+            weights_window = np.zeros_like(sigma0_window, dtype=np.float64)
+            weights_window[valid] = 1.0 / np.maximum(distance2_window[valid], 1.0)
+
+        elif weighting == "gaussian":
+            if gaussian_sigma_m <= 0: raise ValueError("gaussian_sigma_m must be positive.")
+            # Gaussian weights based on distance to FINO1.
+            d2_min = np.min(distance2_window[valid]) if valid.any() else np.inf
+            if not np.isfinite(d2_min): raise ValueError("No valid pixels available.")
+            exponent = -(distance2_window - d2_min) / (2.0 * gaussian_sigma_m**2)
+            weights_window = np.zeros_like(sigma0_window, dtype=np.float64)
+            weights_window[valid] = np.exp(exponent[valid])
+            weights_window /= weights_window.sum()
+
+        else: raise ValueError("weighting must be None, 'uniform' or 'gaussian'.")
 
         print("=================================")
         print("Wind retrieval window")
         print("level =", level)
         print("window shape =", sigma0_window.shape)
         print("center pixel =", (y_idx, x_idx))
-        print("=================================")
         
         # 2. Get incidence angle at the same position
         theta_da = tile['incident_angle']
@@ -892,13 +916,17 @@ class SARProcessor:
         #Flat values for residuals
         sigma0_flat = sigma0_window.ravel()
         theta_flat = theta_window.ravel()
+        weights_flat = weights_window.ravel()
         
-        valid_mask = (np.isfinite(sigma0_flat) & np.isfinite(theta_flat) & (sigma0_flat > 0))
+        valid_mask = (np.isfinite(sigma0_flat) & np.isfinite(theta_flat) & np.isfinite(weights_flat) & (sigma0_flat > 0))
         sigma0_flat = sigma0_flat[valid_mask]
         theta_flat = theta_flat[valid_mask]
+        weights_flat = weights_flat[valid_mask]
 
         if sigma0_flat.size < 3:
             raise ValueError(f"Only {sigma0_flat.size} valid pixels in level={level} window.")
+        weights_flat /= np.mean(weights_flat)
+        sqrt_weights = np.sqrt(weights_flat)
 
         # 6. CMOD5-N residual function
         def residuals(params):
@@ -920,7 +948,7 @@ class SARProcessor:
             sigma0_pred = np.maximum(sigma0_pred, 1e-12)
 
             res = sigma0_pred - sigma0_flat
-            return res
+            return sqrt_weights*res
         
         # 8. Multi-start optimization
         v_min, v_max = v_bounds
@@ -982,149 +1010,93 @@ class SARProcessor:
         self.tile = tile
         return v_ret, tile, all_results
 
-    
-
-    def retrieve_wind_profile_parameters(self, wind_speeds, heights, weights,
-        L_bounds=(-1000.0, -1.0), u_star_bounds=(0.01, 2.0),
-        n_starts=5, stability="u",
-        L_prior=None, sigma_logL=2.5
-    ):
-
+    def retrieve_wind_profile_parameters(self, wind_speeds: list[float], heights: list[float], weights: list[float],
+        obukhov_b, u_star_bounds, n_starts: float, stability, z_ref: float,
+        delta_v: bool = False, scaled: bool = False):
+        
         # 1. Convert inputs to arrays
         wind_speeds = np.asarray(wind_speeds, dtype=float).ravel()
         heights = np.asarray(heights, dtype=float).ravel()
-        # Checks
-        if wind_speeds.size != heights.size: raise ValueError("wind_speeds and heights must have the same length.")
-        if wind_speeds.size < 3: raise ValueError("At least 3 measurements are required for this fit.")
-        if not np.all(np.isfinite(wind_speeds)): raise ValueError("wind_speeds must contain finite values.")
-        if not np.all(np.isfinite(heights)) or np.any(heights <= 0): raise ValueError("heights must be finite and positive.")
-        if np.any(wind_speeds < 0): raise ValueError("wind_speeds cannot be negative.")
-        if not isinstance(n_starts, (int, np.integer)) or n_starts < 1: raise ValueError("n_starts must be an integer >= 1.")
+
+        if delta_v:
+            heights_combination, wind_speeds = self.calculate_differences(heights, wind_speeds)
         
-        if weights is None:
+        if weights is None or delta_v:
             weights = np.ones_like(wind_speeds)
-
-        # 2. Normalize stability convention MAP
-        stability_map = { 0: "u", 1: "n", 2: "n", 3: "s", 
-                         "u": "u", "nn": "n", "np": "n", "s": "s"}
-
-        try: stability = stability_map[stability]
-        except (KeyError, TypeError): raise ValueError("stability must be 0/'u', 1/'n', or 2/'s'.")
 
         # 3. Validate friction velocity bounds
         u_min, u_max = map(float, u_star_bounds)
-        if not (0 < u_min < u_max < np.inf): raise ValueError("u_star_bounds must satisfy 0 < lower < upper < infinity.")
 
         # 4. Validate Obukhov length bounds
-        L_min, L_max = map(float, L_bounds)
-        if L_prior is None:
-            L_prior = abs(L_min if stability=="u" else L_max) * 0.1
+        obu_min, obu_max = map(float, obukhov_b)
+
         # 5. Define residual function
         def residuals(params):
-            u_star, L = params
-            wind_pred = diabatic_wind_profile(heights, u_star, L, stability)
+            # Original equation not scaled
+            if not delta_v and not scaled:
+                u_star, L = params
+                wind_pred = diabatic_wind_profile(heights, u_star, L, stability)
+            
+            # Original equation scaled
+            if not delta_v and scaled:
+                u_star, eta = params
+                wind_pred = diabatic_wind_profile(heights, u_star, eta, z_ref=z_ref, scaled=scaled, stability=stability)
+            
+            #Diff equation not scaled
+            if delta_v and not scaled:
+                u_star, L = params
+                wind_pred = delta_diabatic_wind_profile(z2=heights_combination[:,0], z1=heights_combination[:,1], 
+                                                        u_star=u_star, obu_parameter=L, stability=stability)
+            
+            #Diff equation not scaled
+            if delta_v and scaled:
+                u_star, eta = params
+                wind_pred = delta_diabatic_wind_profile(z2=heights_combination[:,0], z1=heights_combination[:,1], 
+                                                        u_star=u_star, obu_parameter=eta, z_ref=z_ref, scaled=scaled, stability=stability)
+                            
             r_data = np.sqrt(weights) * (wind_pred - wind_speeds)
-            r_prior = (np.log(abs(L)) - np.log(L_prior)) / sigma_logL # regularización bayesiana
-            return np.concatenate([r_data, [r_prior]])
-
-        # # 6. Neutral case: L is not estimated
-        # if stability == "n":
-        #     u_grid = np.linspace(u_min, u_max, n_starts)
-
-        #     best_result = None
-        #     best_cost = np.inf
-        #     all_results = {}
-
-        #     for i, u0 in enumerate(u_grid):
-        #         result = least_squares(
-        #             residuals,
-        #             x0=[u0],
-        #             bounds=([u_min], [u_max]),
-        #             method="trf",
-        #             max_nfev=300,
-        #         )
-
-        #         all_results[i] = {
-        #             "u_star_0": float(u0),
-        #             "u_star_ret": float(result.x[0]),
-        #             "cost": float(result.cost),
-        #             "success": bool(result.success),
-        #         }
-
-        #         if result.success and np.isfinite(result.cost):
-        #             if result.cost < best_cost:
-        #                 best_cost = float(result.cost)
-        #                 best_result = result
-
-        #     if best_result is None:
-        #         raise RuntimeError("All neutral optimization attempts failed.")
-
-        #     return np.inf, float(best_result.x[0]), {
-        #         "cost": best_cost,
-        #         "success": bool(best_result.success),
-        #         "optimality": float(best_result.optimality),
-        #         "nfev": int(best_result.nfev),
-        #         "stability": stability,
-        #     }, all_results
-
-        if not (np.isfinite(L_min) and np.isfinite(L_max) and L_min < L_max): raise ValueError("L_bounds must be finite and lower < upper.")
-
-        if stability == "u" and not (L_min < L_max < 0): raise ValueError("For unstable conditions, L_bounds must be negative.")
-        if stability == "s" and not (0 < L_min < L_max): raise ValueError("For stable conditions, L_bounds must be positive.")
+            return r_data
 
         # 7. Multi-start optimization
         u_grid = np.linspace(u_min, u_max, n_starts)
-        L_grid = np.linspace(L_min, L_max, n_starts)
+        obu_grid = np.linspace(obu_min, obu_max, n_starts)
 
         best_result = None
         best_cost = np.inf
         all_results = {}
-        # total_iterations = len(u_grid) * len(L_grid)
         i = 0
         for u0 in u_grid:
-            for L0 in L_grid:
-        # for i, (u0, L0) in enumerate(zip(u_grid, L_grid)):
-                try:
-                    result = least_squares(
-                        residuals,
-                        x0=[u0, L0],
-                        bounds=(
-                            [u_min, L_min],
-                            [u_max, L_max],
-                        ),
-                        method="trf",
-                        x_scale=[0.1, max(1.0, abs(L0))],
-                        max_nfev=1000,
-                    )
+            for obu0 in obu_grid:
+                result = least_squares(
+                    residuals,
+                    x0=[u0, obu0],
+                    bounds=(
+                        [u_min, obu_min],
+                        [u_max, obu_max],
+                    ),
+                    method="trf",
+                    x_scale=[0.1, max(1.0, abs(obu0)) if not scaled else max(0.01, abs(obu0))],
+                    max_nfev=1000,
+                )
 
-                    all_results[i] = {
-                        "u_star_0": float(u0),
-                        "L_0": float(L0),
-                        "u_star_ret": float(result.x[0]),
-                        "L_ret": float(result.x[1]),
-                        "cost": float(result.cost),
-                        "success": bool(result.success),
-                    }
-                    i += 1
+                all_results[i] = {
+                    "u_star_0": float(u0),
+                    "L_0": float(obu0),
+                    "u_star_ret": float(result.x[0]),
+                    "L_ret": float(result.x[1]) if not scaled else float(z_ref/result.x[1]),
+                    "cost": float(result.cost),
+                    "success": bool(result.success),
+                }
+                i += 1
 
-                    if np.isfinite(result.cost) and result.cost < best_cost: # result.success:
-                        # if result.cost < best_cost:
-                        best_cost = float(result.cost)
-                        best_result = result
+                if result.success and np.isfinite(result.cost) and result.cost < best_cost:
+                    best_cost = float(result.cost)
+                    best_result = result
 
-                except (ValueError, FloatingPointError) as exc:
-                    all_results[i] = {
-                        "u_star_0": float(u0),
-                        "L_0": float(L0),
-                        "error": str(exc),
-                    }
-                    i += 1
-
-        if best_result is None:
-            raise RuntimeError("All optimization attempts failed.")
+        if best_result is None: raise RuntimeError("All optimization attempts failed.")
         
         u_star_ret = float(best_result.x[0])
-        L_ret = float(best_result.x[1])
+        L_ret = float(best_result.x[1]) if not scaled else float(z_ref/best_result.x[1])
 
         best_info = {
             "cost": best_cost,
@@ -1136,51 +1108,65 @@ class SARProcessor:
 
         return L_ret, u_star_ret, best_info, all_results
 
-    def retrieve_wind_profile_parameters_all_stability(
-        self,
-        wind_speeds,
-        heights,
-        weights=None,
-        L_bounds_unstable=(-500.0, -10.0),
-        L_bounds_stable=(10.0, 500.0),
-        u_star_bounds=(0.01, 2.0),
-        n_starts=5,
-    ):
-        # (stability, L_bounds) pairs. L_bounds is ignored for neutral.
-        fits = [
-            ("u", L_bounds_unstable),
-            ("nn", (-1000.0, -500.0)),
-            ("np", (500.0, 1000.0)),
-            ("s", L_bounds_stable),
-        ]
-
+    def retrieve_wind_profile_parameters_all_stability(self, wind_speeds, heights, weights=None,
+        u_star_bounds=(0.01, 2.0), n_starts: int = 5, z_ref: float = 60.0, 
+        delta_v: bool = False, scaled: bool = False):
+        
+        fits = self.return_bounds(z_ref, scaled)
         results = {}
 
-        for stability, L_bounds in fits:
-            try:
-                L_ret, u_star_ret, best_info, _ = self.retrieve_wind_profile_parameters(
-                    wind_speeds=wind_speeds,
-                    heights=heights,
-                    weights=weights,
-                    L_bounds=L_bounds,
-                    u_star_bounds=u_star_bounds,
-                    n_starts=n_starts,
-                    stability=stability,
-                )
-                results[stability] = {
-                    "L": float(L_ret),
-                    "u_star": float(u_star_ret),
-                    "cost": float(best_info["cost"]),
-                    "success": bool(best_info["success"]),
-                }
-            except (RuntimeError, ValueError) as exc:
-                # One stability failed -> keep the other two usable.
-                results[stability] = {
-                    "L": np.inf if stability == "n" else np.nan,
-                    "u_star": np.nan,
-                    "cost": np.nan,
-                    "success": False,
-                    "error": str(exc),
-                }
+        for stability, obukhov_b in fits:
+            L_ret, u_star_ret, best_info, all_results = self.retrieve_wind_profile_parameters(
+                wind_speeds=wind_speeds, heights=heights, weights=weights,
+                obukhov_b=obukhov_b, u_star_bounds=u_star_bounds, z_ref=z_ref,
+                n_starts=n_starts, stability=stability, delta_v=delta_v, scaled=scaled)
+            results[stability] = {
+                "L": float(L_ret),
+                "u_star": float(u_star_ret),
+                "cost": float(best_info["cost"]),
+                "success": bool(best_info["success"]),
+            }
 
         return results
+    
+    @staticmethod
+    def calculate_differences(heights: list[float], velocity: list[float]):
+        heights = np.asarray(heights)
+        velocity = np.asarray(velocity)
+
+        max_idx = np.argmax(heights)
+        # min_idx = np.argmin(heights)
+
+        height_pairs = []
+        velocity_diffs = []
+
+        for i in range(len(heights)):
+            if i != max_idx:
+                height_pairs.append([heights[max_idx], heights[i]])
+                velocity_diffs.append(velocity[max_idx] - velocity[i])
+            # if i != min_idx:
+            #     height_pairs.append([heights[i], heights[min_idx]])
+            #     velocity_diffs.append(velocity[i] - velocity[min_idx])
+        return np.array(height_pairs), np.array(velocity_diffs)
+    
+    @staticmethod
+    def return_bounds(z_ref: float = 60.0, scaled: bool = False):
+        low_level = 10.0
+        intermediate_level = 200.0
+        upper_level = 500.0
+        
+        if scaled:
+            fits = [
+                ("u", (z_ref/-low_level, z_ref/-intermediate_level)),
+                ("nu", (z_ref/-intermediate_level, z_ref/-upper_level)),
+                ("ns", (z_ref/upper_level, z_ref/intermediate_level)),
+                ("s", (z_ref/intermediate_level, z_ref/low_level))
+            ]
+        else:
+            fits = [
+                ("u", (-intermediate_level, -low_level)),
+                ("nu", (-upper_level, -intermediate_level)),
+                ("ns", (intermediate_level, upper_level)),
+                ("s", (low_level, intermediate_level)),
+            ]
+        return fits

@@ -27,4 +27,3 @@ class Data_Retrieved_per_file:
 class Data_Retrieved:
     results: dict[str, Data_Retrieved_per_file] = field(default_factory=dict)
     
-all_data = Data_Retrieved()
