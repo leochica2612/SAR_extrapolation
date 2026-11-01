@@ -32,6 +32,7 @@ def export_results_to_excel(
     map_rows = []
     wind_rows = []
     atmospheric_rows = []
+    real_wind_rows = []
     
     relerr_rows = []
     abserr_rows = []
@@ -52,24 +53,32 @@ def export_results_to_excel(
         })
 
         # --------------------------------------------------
-        # Sheet 2: Wind data
+        # Sheet 2: Ral Wind Speed
         # --------------------------------------------------
         if len(values.wind_real) == 0:
             continue
+        real_wind_row = {
+            "MAP NUMBER": values.map_number,
+        }
+        for height, wind in zip(values.heights, values.wind_real):
+            real_wind_row[f"Height [{height} m]"] = wind
+
+        real_wind_rows.append(real_wind_row)
+        
+        # --------------------------------------------------
+        # Sheet 3: Wind data
+        # --------------------------------------------------
         wind_row = {
             "MAP NUMBER": values.map_number,
             "ROW DB": values.row_db,
-            # "STABILITY": values.stability,
             "L REAL [m]": values.L_real,
-            # "L RETRIEVED [m]": values.L_retrieved,
-            # "U* RETRIEVED [m/s]": values.u_star_retrieved,
-            "REAL MC WIND [42 m]": values.wind_real[0],
+            "REAL WIND [lowest altitude m]": values.wind_real[0],
             "REAL WIND EXTRAPOLATED [10m]": values.wind_new_value_10m,
             "REAL DIRECTION [deg]": values.wind_direction,
         }
         len_wind_row = len(wind_row)
         # --------------------------------------------------
-        # Sheet 3: Atmospheric data
+        # Sheet 4: Atmospheric data
         # --------------------------------------------------
         atmospheric_rows.append({
             "MAP NUMBER": values.map_number,
@@ -80,7 +89,7 @@ def export_results_to_excel(
             "U* RETRIEVED [m/s]": values.u_star_retrieved,
         })
         # --------------------------------------------------
-        # Sheet 4: Stadistics Wind data
+        # Sheet 5: Stadistics Wind data
         # --------------------------------------------------
         abserr_row = {
             "MAP NUMBER": values.map_number,
@@ -89,7 +98,7 @@ def export_results_to_excel(
             "MAP NUMBER": values.map_number,
         }
         # --------------------------------------------------
-        # Sheet 5: Final Stadistics Wind data
+        # Sheet 6: Final Stadistics Wind data
         # --------------------------------------------------
         fin_abserr_row = {
             "MAP NUMBER": values.map_number,
@@ -117,7 +126,7 @@ def export_results_to_excel(
                 errors_by_level.setdefault(level, []).append(error)
                 fin_errors_by_level.setdefault(level, []).append(final_error)
                 
-
+        real_wind_df = pd.DataFrame(real_wind_rows)
         wind_rows.append(wind_row)
         abserr_rows.append(abserr_row)
         relerr_rows.append(relerr_row)
@@ -182,6 +191,8 @@ def export_results_to_excel(
         ms["A1"] = "Map"
         ms["A1"].alignment = Alignment(horizontal="center", vertical="center")
         ms["A1"].fill = PatternFill(fill_type="solid", fgColor="D9EAF7")
+        #Real wind
+        real_wind_df.to_excel(writer, sheet_name="Real Wind", index=False)
         # Wind sheet
         wind_df.to_excel(writer, sheet_name="Wind retrieved", index=False, startrow=1)
         ws = writer.sheets["Wind retrieved"]

@@ -14,10 +14,10 @@ def return_stability(L):
     if abs(L)>500:
         if L>500:
             L_bounds = [-1000, -500]
-            stability = "nn"
+            stability = "n"
         else:
             L_bounds = [500, 1000]
-            stability = "np"
+            stability = "n"
     elif L<0:
         L_bounds = [-500,-1]
         stability = "u"

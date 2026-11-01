@@ -14,8 +14,8 @@ from .configManager import Config
 
 from scipy.optimize import least_squares
 from scipy.interpolate import RegularGridInterpolator
+from .algorithms.residuals import least_squares_residuals
 from .algorithms.cmod5_n import calc_sigma0_cmod5_n
-from .algorithms.wind_profile import diabatic_wind_profile, delta_diabatic_wind_profile
 
 # SAR file processor class
 """
@@ -1012,7 +1012,7 @@ class SARProcessor:
 
     def retrieve_wind_profile_parameters(self, wind_speeds: list[float], heights: list[float], weights: list[float],
         obukhov_b, u_star_bounds, n_starts: float, stability, z_ref: float,
-        delta_v: bool = False, scaled: bool = False):
+        delta_v: bool = False, scaled: bool = False, opt:str = "least_squares"):
         
         # 1. Convert inputs to arrays
         wind_speeds = np.asarray(wind_speeds, dtype=float).ravel()
@@ -1020,6 +1020,8 @@ class SARProcessor:
 
         if delta_v:
             heights_combination, wind_speeds = self.calculate_differences(heights, wind_speeds)
+        else:
+            heights_combination = None
         
         if weights is None or delta_v:
             weights = np.ones_like(wind_speeds)
@@ -1030,34 +1032,7 @@ class SARProcessor:
         # 4. Validate Obukhov length bounds
         obu_min, obu_max = map(float, obukhov_b)
 
-        # 5. Define residual function
-        def residuals(params):
-            # Original equation not scaled
-            if not delta_v and not scaled:
-                u_star, L = params
-                wind_pred = diabatic_wind_profile(heights, u_star, L, stability)
-            
-            # Original equation scaled
-            if not delta_v and scaled:
-                u_star, eta = params
-                wind_pred = diabatic_wind_profile(heights, u_star, eta, z_ref=z_ref, scaled=scaled, stability=stability)
-            
-            #Diff equation not scaled
-            if delta_v and not scaled:
-                u_star, L = params
-                wind_pred = delta_diabatic_wind_profile(z2=heights_combination[:,0], z1=heights_combination[:,1], 
-                                                        u_star=u_star, obu_parameter=L, stability=stability)
-            
-            #Diff equation not scaled
-            if delta_v and scaled:
-                u_star, eta = params
-                wind_pred = delta_diabatic_wind_profile(z2=heights_combination[:,0], z1=heights_combination[:,1], 
-                                                        u_star=u_star, obu_parameter=eta, z_ref=z_ref, scaled=scaled, stability=stability)
-                            
-            r_data = np.sqrt(weights) * (wind_pred - wind_speeds)
-            return r_data
-
-        # 7. Multi-start optimization
+        # 5. Multi-start optimization
         u_grid = np.linspace(u_min, u_max, n_starts)
         obu_grid = np.linspace(obu_min, obu_max, n_starts)
 
@@ -1065,16 +1040,27 @@ class SARProcessor:
         best_cost = np.inf
         all_results = {}
         i = 0
+        loss_methods = {
+            "least_squares": "linear",
+            "huber": "huber",
+            "soft_l1": "soft_l1",
+            "cauchy": "cauchy",
+            "arctan": "arctan",
+        }
         for u0 in u_grid:
             for obu0 in obu_grid:
                 result = least_squares(
-                    residuals,
+                    least_squares_residuals,
                     x0=[u0, obu0],
+                    args=(heights, wind_speeds, weights, stability,
+                        delta_v, scaled, z_ref, heights_combination),
                     bounds=(
                         [u_min, obu_min],
                         [u_max, obu_max],
                     ),
                     method="trf",
+                    loss=loss_methods.get(opt, "linear"),
+                    f_scale=1.0,
                     x_scale=[0.1, max(1.0, abs(obu0)) if not scaled else max(0.01, abs(obu0))],
                     max_nfev=1000,
                 )
@@ -1110,7 +1096,7 @@ class SARProcessor:
 
     def retrieve_wind_profile_parameters_all_stability(self, wind_speeds, heights, weights=None,
         u_star_bounds=(0.01, 2.0), n_starts: int = 5, z_ref: float = 60.0, 
-        delta_v: bool = False, scaled: bool = False):
+        delta_v: bool = False, scaled: bool = False, opt:str = "least_squares"):
         
         fits = self.return_bounds(z_ref, scaled)
         results = {}
@@ -1119,7 +1105,7 @@ class SARProcessor:
             L_ret, u_star_ret, best_info, all_results = self.retrieve_wind_profile_parameters(
                 wind_speeds=wind_speeds, heights=heights, weights=weights,
                 obukhov_b=obukhov_b, u_star_bounds=u_star_bounds, z_ref=z_ref,
-                n_starts=n_starts, stability=stability, delta_v=delta_v, scaled=scaled)
+                n_starts=n_starts, stability=stability, delta_v=delta_v, scaled=scaled, opt=opt)
             results[stability] = {
                 "L": float(L_ret),
                 "u_star": float(u_star_ret),
