@@ -10,6 +10,8 @@ class Data_Retrieved_per_file:
     heights: list[float] | None = None
     wind_real: list[float] | None = None # value for each height
     wind_direction: float | None = None # Degrees
+    look_azimuth: float | None = None # Degrees
+    theta: list[float] | None = None # Degrees
     wind_variance: list[float] | None = None # value for each height
     wind_retrieved_10m: dict[int, float] = field(default_factory=dict) # value for each level
 
@@ -21,6 +23,10 @@ class Data_Retrieved_per_file:
 
     # Wind velocity from profile extrapolation
     wind_new_value_10m: float | None = None
+    
+    sigma_expected: list[float] | None = None
+    sigma_sars: list[float] | None = None
+    sigma_sars_filtered: list[float] | None = None
 
 
 @dataclass

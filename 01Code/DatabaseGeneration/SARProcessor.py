@@ -14,8 +14,7 @@ from .configManager import Config
 
 from scipy.optimize import least_squares
 from scipy.interpolate import RegularGridInterpolator
-from .algorithms.residuals import least_squares_residuals
-from .algorithms.cmod5_n import calc_sigma0_cmod5_n
+from .algorithms.residuals import stability_residuals, scatter_residuals
 
 # SAR file processor class
 """
@@ -783,14 +782,19 @@ class SARProcessor:
 
     # def retrieve_stability_from_psd(self):
 
-    def wind_retrieval(self,tile, lat:float, lon:float , var_name='Sigma0_VV_no_targets', v_bounds = (0.5, 40.0),
-        wdir:float = 180.0, n_v_starts: int = 4, wind_direction_convention='from', level:int = 1, 
-        weighting: str = None, gaussian_sigma_m: float = 100.0):
-        # weigthing: None | "uniform" | "gaussian" | "inverse_distance2"
+    def wind_retrieval(self, tile, lat:float, lon:float , var_name='Sigma0_VV_no_targets', v_bounds = (0.5, 40.0),
+        wdir:float = 180.0, n_v_starts: int = 4, level:int = 1, opt:str = "least_squares",
+        weighting: str = None):
+        # weigthing: None | "uniform" | "inverse_distance2" | sigma
         R = 6_371_000.0  # Earth radius in meters
+        
         # 1. Find the SAR pixel closest to the requested lat/lon
-        sigma0_da = tile[var_name] # Sigma0_VV_no_targets is  filtered tile with no obstacles
-        if sigma0_da.ndim != 2: raise ValueError(f"{var_name} must be 2-D. Got shape {sigma0_da.shape}")
+        sigma0_vv_da = tile[var_name] # Sigma0_VV_no_targets is  filtered tile with no obstacles
+        sigma0_vh_da = tile["Sigma0_VH"]
+        if "y" in sigma0_vv_da.coords and "x" in sigma0_vv_da.coords:
+            sigma0_vv_da = sigma0_vv_da.sel(y=sigma0_vv_da.y, x=sigma0_vv_da.x)
+    
+        if sigma0_vv_da.ndim != 2: raise ValueError(f"{var_name} must be 2-D. Got shape {sigma0_vv_da.shape}")
 
         # SAR geographical coordinates
         # Retrieve lat and lon for each SAR pixel a put in an array
@@ -798,7 +802,7 @@ class SARProcessor:
         lon_da = tile['lon']
         lat_array = np.asarray(lat_da.values, dtype=np.float64)
         lon_array = np.asarray(lon_da.values, dtype=np.float64)
-        if lat_array.shape != sigma0_da.shape or lon_array.shape != sigma0_da.shape: raise ValueError("lat/lon and sigma0 must have the same spatial shape.")
+        if lat_array.shape != sigma0_vv_da.shape or lon_array.shape != sigma0_vv_da.shape: raise ValueError("lat/lon and sigma0 must have the same spatial shape.")
 
         # Find closest pixel
         lat0_rad = np.deg2rad(lat)
@@ -811,19 +815,13 @@ class SARProcessor:
         distance2 = distance2_m
         y_idx, x_idx = np.unravel_index(np.argmin(distance2), distance2.shape)
 
-        # ---------------------------------------------
-        # Window around FINO1
-        # level=1 -> 3x3
-        # level=N -> (2*level+1)^2
-        # ---------------------------------------------
 
         if level < 1: raise ValueError("level must be >= 1")
-
         y_min = y_idx - level
         y_max = y_idx + level + 1
         x_min = x_idx - level
         x_max = x_idx + level + 1
-        ny, nx = sigma0_da.shape
+        ny, nx = sigma0_vv_da.shape
         y_min = max(0, y_min)
         y_max = min(ny, y_max)
         x_min = max(0, x_min)
@@ -831,44 +829,33 @@ class SARProcessor:
 
         if y_min < 0 or y_max > ny or x_min < 0 or x_max > nx: raise ValueError(f"Window level={level} around pixel ({y_idx}, {x_idx}) falls outside the SAR image.")
 
-        sigma0_window = np.asarray(sigma0_da.values[y_min:y_max, x_min:x_max],dtype=np.float64)
+        sigma0_vv_window = np.asarray(sigma0_vv_da.values[y_min:y_max, x_min:x_max],dtype=np.float64)
+        sigma0_vh_window = np.asarray(sigma0_vh_da.values[y_min:y_max, x_min:x_max],dtype=np.float64)
         # ---------------------------------------------
         # Distance-based weights
         # ---------------------------------------------
         distance2_window = distance2[y_min:y_max, x_min:x_max]
-        valid = (np.isfinite(distance2_window) & np.isfinite(sigma0_window))
+        valid = (np.isfinite(distance2_window) & np.isfinite(sigma0_vv_window))
 
         if weighting is None:
             # No weighting: ordinary least squares
-            weights_window = np.ones_like(sigma0_window, dtype=np.float64)
-
+            weights_vv_window = np.ones_like(sigma0_vv_window, dtype=np.float64)
+            weights_vh_window = np.ones_like(sigma0_vh_window, dtype=np.float64)
+            
         elif weighting == "uniform":
             # Flat distribution, normalized to sum to 1
-            weights_window = valid.astype(np.float64)
-            weight_sum = weights_window.sum()
+            weights_vv_window = valid.astype(np.float64)
+            weight_sum = weights_vv_window.sum()
             if weight_sum == 0: raise ValueError("No valid pixels available.")
-            weights_window /= weight_sum
+            weights_vv_window /= weight_sum
         elif weighting == "inverse_distance2":
-            weights_window = np.zeros_like(sigma0_window, dtype=np.float64)
-            weights_window[valid] = 1.0 / np.maximum(distance2_window[valid], 1.0)
+            weights_vv_window = np.zeros_like(sigma0_vv_window, dtype=np.float64)
+            weights_vv_window[valid] = 1.0 / np.maximum(distance2_window[valid], 1.0)
+            
+        elif weighting == "sigma":
+            weights_vv_window = 1/sigma0_vv_window
 
-        elif weighting == "gaussian":
-            if gaussian_sigma_m <= 0: raise ValueError("gaussian_sigma_m must be positive.")
-            # Gaussian weights based on distance to FINO1.
-            d2_min = np.min(distance2_window[valid]) if valid.any() else np.inf
-            if not np.isfinite(d2_min): raise ValueError("No valid pixels available.")
-            exponent = -(distance2_window - d2_min) / (2.0 * gaussian_sigma_m**2)
-            weights_window = np.zeros_like(sigma0_window, dtype=np.float64)
-            weights_window[valid] = np.exp(exponent[valid])
-            weights_window /= weights_window.sum()
-
-        else: raise ValueError("weighting must be None, 'uniform' or 'gaussian'.")
-
-        print("=================================")
-        print("Wind retrieval window")
-        print("level =", level)
-        print("window shape =", sigma0_window.shape)
-        print("center pixel =", (y_idx, x_idx))
+        else: raise ValueError("weighting must be None, None or 'uniform' or 'inverse_distance2'.")
         
         # 2. Get incidence angle at the same position
         theta_da = tile['incident_angle']
@@ -881,7 +868,7 @@ class SARProcessor:
             print(f"Warning: expected an 11x11 incidence-angle grid, got {theta_tp.shape}")
 
         # Coordinates of the tie-point grid in pixel coordinates
-        ny, nx = sigma0_da.shape
+        ny, nx = sigma0_vv_da.shape
         tp_y = np.linspace(0.0, ny - 1.0, tp_ny)
         tp_x = np.linspace(0.0, nx - 1.0, tp_nx)
 
@@ -890,8 +877,7 @@ class SARProcessor:
         # Pixel coordinates of the window
         window_y, window_x = np.meshgrid(np.arange(y_min, y_max), np.arange(x_min, x_max), indexing='ij')
         points = np.column_stack([window_y.ravel(), window_x.ravel()])
-        theta_window = interpolator(points).reshape(sigma0_window.shape)
-        print("theta_window shape =", theta_window.shape)
+        theta_window = interpolator(points).reshape(sigma0_vv_window.shape)
 
         # 3. Platform heading (satellite fligh heading)
         heading_raw = tile['platform_heading'].values
@@ -907,71 +893,53 @@ class SARProcessor:
         # Sentinel-1 is not right-looking.
         # For a right-looking SAR --> look azimuth = platform heading + 90° # TODO
         look_azimuth = platform_heading % 360.0
-        print("look_azimuth 00: ", look_azimuth)
-
-        # 5. Wind direction convention
-        if wind_direction_convention not in ('from', 'to'):
-            raise ValueError("wind_direction_convention must be 'from' or 'to'.")
         
         #Flat values for residuals
-        sigma0_flat = sigma0_window.ravel()
+        sigma0_vv_flat = sigma0_vv_window.ravel()
+        sigma0_vh_flat = sigma0_vh_window.ravel()
         theta_flat = theta_window.ravel()
-        weights_flat = weights_window.ravel()
+        weights_vv_flat = weights_vv_window.ravel()
         
-        valid_mask = (np.isfinite(sigma0_flat) & np.isfinite(theta_flat) & np.isfinite(weights_flat) & (sigma0_flat > 0))
-        sigma0_flat = sigma0_flat[valid_mask]
+        valid_mask = (np.isfinite(sigma0_vv_flat) & np.isfinite(theta_flat) & np.isfinite(weights_vv_flat) & (sigma0_vv_flat>0) & (sigma0_vv_flat <= 0.6)) # & np.isfinite(sigma0_vh_flat) & (sigma0_vv_flat <= 0.6)
+        sigma0_vv_flat = sigma0_vv_flat[valid_mask]
+        sigma0_vh_flat = sigma0_vh_flat[valid_mask]
         theta_flat = theta_flat[valid_mask]
-        weights_flat = weights_flat[valid_mask]
+        weights_vv_flat = weights_vv_flat[valid_mask]
 
-        if sigma0_flat.size < 3:
-            raise ValueError(f"Only {sigma0_flat.size} valid pixels in level={level} window.")
-        weights_flat /= np.mean(weights_flat)
-        sqrt_weights = np.sqrt(weights_flat)
-
-        # 6. CMOD5-N residual function
-        def residuals(params):
-            v = float(params[0])
-            if wind_direction_convention == 'from':
-                wind_to = (wdir + 180.0) % 360.0 # Normalize direction.
-            else:
-                wind_to = wdir % 360.0 # Normalize direction.
-
-            phi_rel = (wind_to - look_azimuth) # relative angle between wind direction and satellite heading
-
-            phi_rel = (phi_rel + 180.0) % 360.0 - 180.0 # [-180°, 180°) TODO: why?
-
-            # CMOD5-N
-            sigma0_pred = calc_sigma0_cmod5_n(v, phi_rel, theta_flat) #Using empirical equation
-            # Guard against numerical problems.
-            sigma0_pred = np.asarray(sigma0_pred, dtype=np.float64)
-
-            sigma0_pred = np.maximum(sigma0_pred, 1e-12)
-
-            res = sigma0_pred - sigma0_flat
-            return sqrt_weights*res
+        if sigma0_vv_flat.size < 3:
+            raise ValueError(f"Only {sigma0_vv_flat.size} valid pixels in level={level} window.")
         
-        # 8. Multi-start optimization
+        sqrt_weights = np.sqrt(weights_vv_flat)
+        
+        # 6. Multi-start optimization
         v_min, v_max = v_bounds
 
         v_grid = np.linspace(v_min, v_max, n_v_starts)
-
+        
         best_result = None
         best_cost = np.inf
         all_results = dict()
         iteration = 0
+        loss_methods = {
+            "least_squares": "linear",
+            "huber": "huber",
+            "soft_l1": "soft_l1",
+        }
         for v0 in v_grid:
             try:
                 result = least_squares(
-                    residuals,
+                    scatter_residuals,
                     x0=[v0],
+                    args=(wdir, look_azimuth, theta_flat, sigma0_vv_flat, sigma0_vh_flat, sqrt_weights),
                     bounds=([v_min], [v_max]),
+                    # loss=loss_methods.get(opt, "linear"),
+                    # f_scale=1.0,
                     method='trf',
-                    max_nfev=300,
+                    max_nfev=400,
                 )
 
                 if result.success and np.isfinite(result.cost):
                     v_ret = float(result.x[0])
-                    # phi_ret = float(result.x[1] % 360.0)
 
                     all_results[iteration] = {
                         # 'result': result,
@@ -995,20 +963,14 @@ class SARProcessor:
         if best_result is None:
             print( "wind_retrieval: all optimization attempts failed.")
             self.retrieved_wind_speed = np.nan
-            return np.nan, tile, all_results
+            return np.nan, tile, all_results, np.array(list(set(theta_flat))), np.array(list(set(sigma0_vv_flat)))
 
         # 9. Retrieve solution
         v_ret = float(best_result.x[0])
-        # phi_ret = float(best_result.x[1] % 360.0)
 
         # 10. Store results
         self.retrieved_wind_speed = v_ret
-        tile['retrieved_wind_speed'] = v_ret
-        tile['wind_retrieval_cost'] = float(best_cost)
-        tile['platform_heading_used'] = float(platform_heading)
-        tile['radar_look_azimuth_used'] = float(look_azimuth)
-        self.tile = tile
-        return v_ret, tile, all_results
+        return v_ret, tile, all_results, np.array(list(set(theta_flat))), np.array(list(set(sigma0_vv_flat)))
 
     def retrieve_wind_profile_parameters(self, wind_speeds: list[float], heights: list[float], weights: list[float],
         obukhov_b, u_star_bounds, n_starts: float, stability, z_ref: float,
@@ -1044,13 +1006,11 @@ class SARProcessor:
             "least_squares": "linear",
             "huber": "huber",
             "soft_l1": "soft_l1",
-            "cauchy": "cauchy",
-            "arctan": "arctan",
         }
         for u0 in u_grid:
             for obu0 in obu_grid:
                 result = least_squares(
-                    least_squares_residuals,
+                    stability_residuals,
                     x0=[u0, obu0],
                     args=(heights, wind_speeds, weights, stability,
                         delta_v, scaled, z_ref, heights_combination),
@@ -1138,8 +1098,8 @@ class SARProcessor:
     @staticmethod
     def return_bounds(z_ref: float = 60.0, scaled: bool = False):
         low_level = 10.0
-        intermediate_level = 200.0
-        upper_level = 500.0
+        intermediate_level = 500.0
+        upper_level = 3000.0
         
         if scaled:
             fits = [

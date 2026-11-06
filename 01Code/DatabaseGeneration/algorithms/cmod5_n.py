@@ -115,3 +115,25 @@ def calc_sigma0_cmod5_n(v, phi, theta):
         CMOD5_N = B0 * (1.0 + B1 * CSFI + B2 * CS2FI) ** ZPOW
 
         return CMOD5_N
+    
+def calc_sigma0_s1w_nr(v, theta):
+
+    v = np.asarray(v, dtype=np.float64)
+    theta = np.asarray(theta, dtype=np.float64)
+
+    # Broadcast wind speed and incidence angle
+    v, theta = np.broadcast_arrays(v, theta)
+
+    sigma0_db = np.full(theta.shape, np.nan, dtype=np.float64)
+
+    mask1 = (theta >= 31) & (theta < 35.9)
+    mask2 = (theta >= 35.9) & (theta < 41.3)
+    mask3 = (theta >= 41.3) & (theta < 46)
+
+    sigma0_db[mask1] = (0.22 * v[mask1] - 0.13 * theta[mask1] - 25.38)
+    sigma0_db[mask2] = (4.67 * v[mask2]**0.39 - 0.02 * theta[mask2]**2 - 1.46 * theta[mask2] - 12.76)
+    sigma0_db[mask3] = (-56.67 * v[mask3]**(-0.26) - 0.03 * theta[mask3]**2 - 2.58 * theta[mask3] + 55.25)
+
+    return 10.0**(sigma0_db / 10.0)
+
+    
