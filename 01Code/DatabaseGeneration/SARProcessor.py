@@ -15,6 +15,7 @@ from .configManager import Config
 from scipy.optimize import least_squares
 from scipy.interpolate import RegularGridInterpolator
 from .algorithms.residuals import stability_residuals, scatter_residuals
+from .utils.utils import windows_for_tile, check_tile_for_wind_retrieve, dist_and_closest_pixel, values_windows, return_weight, return_bounds
 
 # SAR file processor class
 """
@@ -786,112 +787,42 @@ class SARProcessor:
         wdir:float = 180.0, n_v_starts: int = 4, level:int = 1, opt:str = "least_squares",
         weighting: str = None):
         # weigthing: None | "uniform" | "inverse_distance2" | sigma
-        R = 6_371_000.0  # Earth radius in meters
         
-        # 1. Find the SAR pixel closest to the requested lat/lon
-        sigma0_vv_da = tile[var_name] # Sigma0_VV_no_targets is  filtered tile with no obstacles
-        sigma0_vh_da = tile["Sigma0_VH"]
-        if "y" in sigma0_vv_da.coords and "x" in sigma0_vv_da.coords:
-            sigma0_vv_da = sigma0_vv_da.sel(y=sigma0_vv_da.y, x=sigma0_vv_da.x)
-    
-        if sigma0_vv_da.ndim != 2: raise ValueError(f"{var_name} must be 2-D. Got shape {sigma0_vv_da.shape}")
-
-        # SAR geographical coordinates
-        # Retrieve lat and lon for each SAR pixel a put in an array
-        lat_da = tile['lat']
-        lon_da = tile['lon']
-        lat_array = np.asarray(lat_da.values, dtype=np.float64)
-        lon_array = np.asarray(lon_da.values, dtype=np.float64)
-        if lat_array.shape != sigma0_vv_da.shape or lon_array.shape != sigma0_vv_da.shape: raise ValueError("lat/lon and sigma0 must have the same spatial shape.")
+        #Obtain necessary data from tile
+        sigma0_vv_da, sigma0_vh_da, lat_array, lon_array, theta_tp, platform_heading = check_tile_for_wind_retrieve(tile, var_name, "Sigma0_VH", "lat", "lon")
+        if sigma0_vv_da is None: raise ValueError(f"Error in check tile: {sigma0_vh_da}")
 
         # Find closest pixel
-        lat0_rad = np.deg2rad(lat)
-        dx = R * np.cos(lat0_rad) * np.deg2rad(lon_array - lon)
-        dy = R * np.deg2rad(lat_array - lat)
-        distance2_m = dx**2 + dy**2
-        invalid = ~np.isfinite(lat_array) | ~np.isfinite(lon_array)
-        distance2_m[invalid] = np.inf
-        # distance2 = (lat_array - lat)**2 + (lon_array - lon)**2 # TODO: here we already have the distance to each pixel respecto to FINO1
-        distance2 = distance2_m
-        y_idx, x_idx = np.unravel_index(np.argmin(distance2), distance2.shape)
+        y_idx, x_idx, distance2 = dist_and_closest_pixel(lat_array, lon_array, lat, lon)
 
-
-        if level < 1: raise ValueError("level must be >= 1")
-        y_min = y_idx - level
-        y_max = y_idx + level + 1
-        x_min = x_idx - level
-        x_max = x_idx + level + 1
+        #Idx to retrieve data from the desired window
         ny, nx = sigma0_vv_da.shape
-        y_min = max(0, y_min)
-        y_max = min(ny, y_max)
-        x_min = max(0, x_min)
-        x_max = min(nx, x_max)
+        windows_min, windows_max = windows_for_tile(level, x_idx, y_idx, nx, ny)
+        if windows_min is None: raise ValueError("Error during windows_for_tile()")
 
-        if y_min < 0 or y_max > ny or x_min < 0 or x_max > nx: raise ValueError(f"Window level={level} around pixel ({y_idx}, {x_idx}) falls outside the SAR image.")
-
-        sigma0_vv_window = np.asarray(sigma0_vv_da.values[y_min:y_max, x_min:x_max],dtype=np.float64)
-        sigma0_vh_window = np.asarray(sigma0_vh_da.values[y_min:y_max, x_min:x_max],dtype=np.float64)
-        # ---------------------------------------------
-        # Distance-based weights
-        # ---------------------------------------------
-        distance2_window = distance2[y_min:y_max, x_min:x_max]
-        valid = (np.isfinite(distance2_window) & np.isfinite(sigma0_vv_window))
-
-        if weighting is None:
-            # No weighting: ordinary least squares
-            weights_vv_window = np.ones_like(sigma0_vv_window, dtype=np.float64)
-            weights_vh_window = np.ones_like(sigma0_vh_window, dtype=np.float64)
-            
-        elif weighting == "uniform":
-            # Flat distribution, normalized to sum to 1
-            weights_vv_window = valid.astype(np.float64)
-            weight_sum = weights_vv_window.sum()
-            if weight_sum == 0: raise ValueError("No valid pixels available.")
-            weights_vv_window /= weight_sum
-        elif weighting == "inverse_distance2":
-            weights_vv_window = np.zeros_like(sigma0_vv_window, dtype=np.float64)
-            weights_vv_window[valid] = 1.0 / np.maximum(distance2_window[valid], 1.0)
-            
-        elif weighting == "sigma":
-            weights_vv_window = 1/sigma0_vv_window
-
-        else: raise ValueError("weighting must be None, None or 'uniform' or 'inverse_distance2'.")
+        #Get those values of the window
+        sigma0_vv_window = values_windows(sigma0_vv_da.values, windows_min, windows_max)
+        sigma0_vh_window = values_windows(sigma0_vh_da.values, windows_min, windows_max)
+        distance2_window = values_windows(distance2, windows_min, windows_max)
         
-        # 2. Get incidence angle at the same position
-        theta_da = tile['incident_angle']
-        theta_tp = np.asarray(theta_da.values, dtype=np.float64)
-        if theta_tp.ndim != 2:
-            raise ValueError("incident_angle must be a 2-D tie-point grid.")
-        tp_ny, tp_nx = theta_tp.shape
-
-        if (tp_ny, tp_nx) != (11, 11):
-            print(f"Warning: expected an 11x11 incidence-angle grid, got {theta_tp.shape}")
+        weights_vv_window = return_weight(weighting, sigma0_vv_window, sigma0_vh_window, distance2_window)
+        if weights_vv_window is None: raise ValueError("Error during return_weight")
 
         # Coordinates of the tie-point grid in pixel coordinates
+        tp_ny, tp_nx = theta_tp.shape
         ny, nx = sigma0_vv_da.shape
         tp_y = np.linspace(0.0, ny - 1.0, tp_ny)
         tp_x = np.linspace(0.0, nx - 1.0, tp_nx)
-
         interpolator = RegularGridInterpolator((tp_y, tp_x), theta_tp, method='linear', bounds_error=False, fill_value=None)
         
         # Pixel coordinates of the window
-        window_y, window_x = np.meshgrid(np.arange(y_min, y_max), np.arange(x_min, x_max), indexing='ij')
+        window_y, window_x = np.meshgrid(np.arange(windows_min[0], windows_max[0]), np.arange(windows_min[1], windows_max[1]), indexing='ij')
         points = np.column_stack([window_y.ravel(), window_x.ravel()])
         theta_window = interpolator(points).reshape(sigma0_vv_window.shape)
 
-        # 3. Platform heading (satellite fligh heading)
-        heading_raw = tile['platform_heading'].values
-
-        try:
-            platform_heading = float(np.asarray(heading_raw).item())
-        except (TypeError, ValueError):
-            raise ValueError(f"Could not convert platform_heading={heading_raw!r} to float.")
-
-        # Normalize to [0, 360)
-        platform_heading %= 360.0
 
         # Sentinel-1 is not right-looking.
-        # For a right-looking SAR --> look azimuth = platform heading + 90° # TODO
+        # For a right-looking SAR --> look azimuth = platform heading + 90°
         look_azimuth = platform_heading % 360.0
         
         #Flat values for residuals
@@ -900,40 +831,33 @@ class SARProcessor:
         theta_flat = theta_window.ravel()
         weights_vv_flat = weights_vv_window.ravel()
         
+        # Mask to avoid nan
         valid_mask = (np.isfinite(sigma0_vv_flat) & np.isfinite(theta_flat) & np.isfinite(weights_vv_flat) & (sigma0_vv_flat>0) & (sigma0_vv_flat <= 0.6)) # & np.isfinite(sigma0_vh_flat) & (sigma0_vv_flat <= 0.6)
         sigma0_vv_flat = sigma0_vv_flat[valid_mask]
         sigma0_vh_flat = sigma0_vh_flat[valid_mask]
         theta_flat = theta_flat[valid_mask]
         weights_vv_flat = weights_vv_flat[valid_mask]
 
-        if sigma0_vv_flat.size < 3:
-            raise ValueError(f"Only {sigma0_vv_flat.size} valid pixels in level={level} window.")
         
-        sqrt_weights = np.sqrt(weights_vv_flat)
-        
-        # 6. Multi-start optimization
+        # Multi-start optimization
         v_min, v_max = v_bounds
-
         v_grid = np.linspace(v_min, v_max, n_v_starts)
         
         best_result = None
         best_cost = np.inf
         all_results = dict()
         iteration = 0
-        loss_methods = {
-            "least_squares": "linear",
-            "huber": "huber",
-            "soft_l1": "soft_l1",
-        }
+        loss_methods = {"least_squares": "linear", "huber": "huber", "soft_l1": "soft_l1"}
+        
         for v0 in v_grid:
             try:
                 result = least_squares(
                     scatter_residuals,
                     x0=[v0],
-                    args=(wdir, look_azimuth, theta_flat, sigma0_vv_flat, sigma0_vh_flat, sqrt_weights),
+                    args=(wdir, look_azimuth, theta_flat, sigma0_vv_flat, sigma0_vh_flat, weights_vv_flat),
                     bounds=([v_min], [v_max]),
-                    # loss=loss_methods.get(opt, "linear"),
-                    # f_scale=1.0,
+                    loss=loss_methods.get(opt, "linear"),
+                    f_scale=1.0,
                     method='trf',
                     max_nfev=400,
                 )
@@ -1058,7 +982,7 @@ class SARProcessor:
         u_star_bounds=(0.01, 2.0), n_starts: int = 5, z_ref: float = 60.0, 
         delta_v: bool = False, scaled: bool = False, opt:str = "least_squares"):
         
-        fits = self.return_bounds(z_ref, scaled)
+        fits = return_bounds(z_ref, scaled)
         results = {}
 
         for stability, obukhov_b in fits:
@@ -1094,25 +1018,3 @@ class SARProcessor:
             #     height_pairs.append([heights[i], heights[min_idx]])
             #     velocity_diffs.append(velocity[i] - velocity[min_idx])
         return np.array(height_pairs), np.array(velocity_diffs)
-    
-    @staticmethod
-    def return_bounds(z_ref: float = 60.0, scaled: bool = False):
-        low_level = 10.0
-        intermediate_level = 500.0
-        upper_level = 3000.0
-        
-        if scaled:
-            fits = [
-                ("u", (z_ref/-low_level, z_ref/-intermediate_level)),
-                ("nu", (z_ref/-intermediate_level, z_ref/-upper_level)),
-                ("ns", (z_ref/upper_level, z_ref/intermediate_level)),
-                ("s", (z_ref/intermediate_level, z_ref/low_level))
-            ]
-        else:
-            fits = [
-                ("u", (-intermediate_level, -low_level)),
-                ("nu", (-upper_level, -intermediate_level)),
-                ("ns", (intermediate_level, upper_level)),
-                ("s", (low_level, intermediate_level)),
-            ]
-        return fits

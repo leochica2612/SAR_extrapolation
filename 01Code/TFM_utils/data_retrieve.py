@@ -31,5 +31,5 @@ class Data_Retrieved_per_file:
 
 @dataclass
 class Data_Retrieved:
-    results: dict[str, Data_Retrieved_per_file] = field(default_factory=dict)
+    results: dict[str, Data_Retrieved_per_file] = field(default_factory=dict) # [filename, dict]
     
