@@ -116,8 +116,8 @@ def calc_sigma0_cmod5_n(v, phi, theta):
 
         return CMOD5_N
     
-def calc_sigma0_s1w_nr(v, theta):
-
+def calc_sigma0_s1iw_nr(v, theta):
+    # Valid for v < 30
     v = np.asarray(v, dtype=np.float64)
     theta = np.asarray(theta, dtype=np.float64)
 
@@ -131,8 +131,8 @@ def calc_sigma0_s1w_nr(v, theta):
     mask3 = (theta >= 41.3) & (theta < 46)
 
     sigma0_db[mask1] = (0.22 * v[mask1] - 0.13 * theta[mask1] - 25.38)
-    sigma0_db[mask2] = (4.67 * v[mask2]**0.39 - 0.02 * theta[mask2]**2 - 1.46 * theta[mask2] - 12.76)
-    sigma0_db[mask3] = (-56.67 * v[mask3]**(-0.26) - 0.03 * theta[mask3]**2 - 2.58 * theta[mask3] + 55.25)
+    sigma0_db[mask2] = (4.67 * v[mask2]**0.39 + 0.02 * theta[mask2]**2 - 1.46 * theta[mask2] - 12.76)
+    sigma0_db[mask3] = (-56.67 * v[mask3]**(-0.26) + 0.03 * theta[mask3]**2 - 2.58 * theta[mask3] + 55.25)
 
     return 10.0**(sigma0_db / 10.0)
 

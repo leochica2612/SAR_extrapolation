@@ -24,9 +24,10 @@ class Data_Retrieved_per_file:
     # Wind velocity from profile extrapolation
     wind_new_value_10m: float | None = None
     
-    sigma_expected: list[float] | None = None
+    # Sigma extractions
+    sigma_expected: float | None = None
     sigma_sars: list[float] | None = None
-    sigma_sars_filtered: list[float] | None = None
+    sigma_sars_mean: float | None = None
 
 
 @dataclass

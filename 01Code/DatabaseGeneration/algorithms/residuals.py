@@ -1,5 +1,5 @@
 from .wind_profile import diabatic_wind_profile, delta_diabatic_wind_profile
-from .cmod5_n import calc_sigma0_cmod5_n, calc_sigma0_s1w_nr
+from .cmod5_n import calc_sigma0_cmod5_n, calc_sigma0_s1iw_nr
 import numpy as np
 
 def stability_residuals(params,
@@ -47,11 +47,10 @@ def scatter_residuals(params,
     sigma0_pred = np.asarray(sigma0_pred, dtype=np.float64)
     sigma0_pred = np.maximum(sigma0_pred, 1e-12)
     res_vv = sigma0_pred - sigma0_vv
-    # res_vv = to_db(sigma0_pred) - to_db(sigma0_vv)
     
-    # CMOD5-N
-    # sigma0_pred2 = calc_sigma0_s1w_nr(v, theta) #Using empirical equation
+    # S1IW.NR
+    # sigma0_pred2 = calc_sigma0_s1iw_nr(v, theta) #Using empirical equation
     # sigma0_pred2 = np.maximum(sigma0_pred2, 1e-12)
-    # res_vh = to_db(sigma0_pred2) - to_db(sigma0_vh)
+    # res_vv = to_db(sigma0_pred2) - to_db(sigma0_vh)
 
     return np.concatenate([np.ravel(sqrt_weights*res_vv)]) #, np.ravel(0.1*sqrt_weights*res_vh)])

@@ -57,7 +57,7 @@ def windows_for_tile(level:int, x_idx:int, y_idx:int, nx, ny):
     
     return (y_min, x_min), (y_max, x_max)
 
-def dist_and_closest_pixel(lat_array, lon_array, lat0, lon0):
+def dist(lat_array, lon_array, lat0, lon0):
     R = 6_371_000.0  # Earth radius in meters
     # Find closest pixel
     lat0_rad = np.deg2rad(lat0)
@@ -66,6 +66,11 @@ def dist_and_closest_pixel(lat_array, lon_array, lat0, lon0):
     distance2_m = dx**2 + dy**2
     invalid = ~np.isfinite(lat_array) | ~np.isfinite(lon_array)
     distance2_m[invalid] = np.inf
+    return distance2_m
+    
+
+def dist_and_closest_pixel(lat_array, lon_array, lat0, lon0):
+    distance2_m = dist(lat_array, lon_array, lat0, lon0)
     y_idx, x_idx = np.unravel_index(np.argmin(distance2_m), distance2_m.shape)
     
     return y_idx, x_idx, distance2_m

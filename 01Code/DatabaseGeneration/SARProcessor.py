@@ -15,7 +15,7 @@ from .configManager import Config
 from scipy.optimize import least_squares
 from scipy.interpolate import RegularGridInterpolator
 from .algorithms.residuals import stability_residuals, scatter_residuals
-from .utils.utils import windows_for_tile, check_tile_for_wind_retrieve, dist_and_closest_pixel, values_windows, return_weight, return_bounds
+from .utils.utils import windows_for_tile, check_tile_for_wind_retrieve, dist_and_closest_pixel, dist, values_windows, return_weight, return_bounds
 
 # SAR file processor class
 """
@@ -785,7 +785,7 @@ class SARProcessor:
 
     def wind_retrieval(self, tile, lat:float, lon:float , var_name='Sigma0_VV_no_targets', v_bounds = (0.5, 40.0),
         wdir:float = 180.0, n_v_starts: int = 4, level:int = 1, opt:str = "least_squares",
-        weighting: str = None):
+        weighting: str = None, _y_idx = None, _x_idx = None):
         # weigthing: None | "uniform" | "inverse_distance2" | sigma
         
         #Obtain necessary data from tile
@@ -793,8 +793,12 @@ class SARProcessor:
         if sigma0_vv_da is None: raise ValueError(f"Error in check tile: {sigma0_vh_da}")
 
         # Find closest pixel
-        y_idx, x_idx, distance2 = dist_and_closest_pixel(lat_array, lon_array, lat, lon)
-
+        if _y_idx is None and _x_idx is None:
+            y_idx, x_idx, distance2 = dist_and_closest_pixel(lat_array, lon_array, lat, lon)
+        else:
+            y_idx = _y_idx
+            x_idx = _x_idx  
+          
         #Idx to retrieve data from the desired window
         ny, nx = sigma0_vv_da.shape
         windows_min, windows_max = windows_for_tile(level, x_idx, y_idx, nx, ny)
@@ -803,7 +807,14 @@ class SARProcessor:
         #Get those values of the window
         sigma0_vv_window = values_windows(sigma0_vv_da.values, windows_min, windows_max)
         sigma0_vh_window = values_windows(sigma0_vh_da.values, windows_min, windows_max)
-        distance2_window = values_windows(distance2, windows_min, windows_max)
+        if _y_idx is not None and _x_idx is not None:
+            distance2_window = dist(
+                values_windows(lat_array, windows_min, windows_max),
+                values_windows(lon_array, windows_min, windows_max),
+                lat, lon
+            )
+        else:
+            distance2_window = values_windows(distance2, windows_min, windows_max)
         
         weights_vv_window = return_weight(weighting, sigma0_vv_window, sigma0_vh_window, distance2_window)
         if weights_vv_window is None: raise ValueError("Error during return_weight")
@@ -833,6 +844,7 @@ class SARProcessor:
         
         # Mask to avoid nan
         valid_mask = (np.isfinite(sigma0_vv_flat) & np.isfinite(theta_flat) & np.isfinite(weights_vv_flat) & (sigma0_vv_flat>0) & (sigma0_vv_flat <= 0.6)) # & np.isfinite(sigma0_vh_flat) & (sigma0_vv_flat <= 0.6)
+        # valid_mask = (np.isfinite(sigma0_vh_flat) & np.isfinite(theta_flat) & np.isfinite(weights_vv_flat) & (sigma0_vh_flat>0) & (sigma0_vh_flat <= 0.6))
         sigma0_vv_flat = sigma0_vv_flat[valid_mask]
         sigma0_vh_flat = sigma0_vh_flat[valid_mask]
         theta_flat = theta_flat[valid_mask]
@@ -887,14 +899,14 @@ class SARProcessor:
         if best_result is None:
             print( "wind_retrieval: all optimization attempts failed.")
             self.retrieved_wind_speed = np.nan
-            return np.nan, tile, all_results, np.array(list(set(theta_flat))), np.array(list(set(sigma0_vv_flat)))
+            return np.nan, tile, all_results, np.array(list(set(theta_flat))), np.array(list(set(sigma0_vv_flat))), y_idx, x_idx
 
         # 9. Retrieve solution
         v_ret = float(best_result.x[0])
 
         # 10. Store results
         self.retrieved_wind_speed = v_ret
-        return v_ret, tile, all_results, np.array(list(set(theta_flat))), np.array(list(set(sigma0_vv_flat)))
+        return v_ret, tile, all_results, np.array(list(set(theta_flat))), np.array(list(set(sigma0_vv_flat))), y_idx, x_idx
 
     def retrieve_wind_profile_parameters(self, wind_speeds: list[float], heights: list[float], weights: list[float],
         obukhov_b, u_star_bounds, n_starts: float, stability, z_ref: float,

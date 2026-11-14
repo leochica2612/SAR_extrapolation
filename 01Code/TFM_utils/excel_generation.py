@@ -33,6 +33,7 @@ def export_results_to_excel(
     wind_rows = []
     atmospheric_rows = []
     real_wind_rows = []
+    sigma_rows = []
     
     relerr_rows = []
     abserr_rows = []
@@ -106,6 +107,52 @@ def export_results_to_excel(
         fin_relerr_row = {
             "MAP NUMBER": values.map_number,
         }
+        # --------------------------------------------------
+        # Sheet 7: Sigma Analysis
+        # --------------------------------------------------
+
+        sigma_expected = values.sigma_expected
+        sigma_mean = values.sigma_sars_mean
+        sigma_sars = values.sigma_sars
+
+        # Default values
+        sigma_p25 = np.nan
+        sigma_p75 = np.nan
+        absolute_error = np.nan
+        relative_error = np.nan
+        flag = False
+        message = ""
+
+        # Calculate errors
+        if sigma_expected is not None and sigma_mean is not None:
+            absolute_error = abs(sigma_expected - sigma_mean)
+            if sigma_mean != 0:
+                relative_error = absolute_error / abs(sigma_mean)
+
+        # Calculate percentiles from SAR sigma distribution
+        if sigma_sars is not None and len(sigma_sars) > 0:
+            sigma_p25 = np.percentile(sigma_sars, 25)
+            sigma_p75 = np.percentile(sigma_sars, 75)
+            if sigma_expected is not None:
+                if sigma_expected > sigma_p75:
+                    flag = True
+                    message = ("This tile can apparently be solved using the GMF S1IW.")
+
+                elif sigma_expected < sigma_p25:
+                    flag = True
+                    message = ("Too much noise, a better filtering is needed.")
+
+        sigma_rows.append({
+            "MAP NUMBER": values.map_number,
+            "SIGMA EXPECTED": sigma_expected,
+            "SIGMA SARS MEAN": sigma_mean,
+            "ABSOLUTE ERROR": absolute_error,
+            "RELATIVE ERROR": relative_error,
+            "SIGMA P25": sigma_p25,
+            "SIGMA P75": sigma_p75,
+            "FLAG": flag,
+            "MESSAGE": message,
+        })
 
         # Retrieved wind for each level
         len_levels = 0
@@ -177,6 +224,8 @@ def export_results_to_excel(
     fin_metrics_df.columns = fin_metrics_df.columns.map(str)
     fin_metrics_df = fin_metrics_df.rename(columns={"index": "MAP NUMBER"})
     fin_stadistics_wind_df = pd.concat([fin_abserr_df, empty_rows, fin_relerr_df, empty_rows, fin_metrics_df], ignore_index=True, sort=False)
+    # ------------------------------------------
+    sigma_df = pd.DataFrame(sigma_rows)
 
     # Export both sheets
     light_grey = PatternFill(fill_type="solid", fgColor="D9D9D9")
@@ -209,6 +258,7 @@ def export_results_to_excel(
         atmospheric_df.to_excel(writer, sheet_name="Atmospheric retrieved", index=False, startrow=1)
         stadistics_wind_df.to_excel(writer, sheet_name="Statistics Wind", index=False, startrow=1)
         fin_stadistics_wind_df.to_excel(writer, sheet_name="Final Statistics Wind", index=False, startrow=1)
+        sigma_df.to_excel(writer, sheet_name="Sigma Analysis", index=False)
         
         for sheet, ranges in [
             (ms, ["A1:B1"]),
