@@ -784,7 +784,7 @@ class SARProcessor:
     # def retrieve_stability_from_psd(self):
 
     def wind_retrieval(self, tile, lat:float, lon:float , var_name='Sigma0_VV_no_targets', v_bounds = (0.5, 40.0),
-        wdir:float = 180.0, n_v_starts: int = 4, level:int = 1, opt:str = "least_squares",
+        wdir:float = 180.0, n_v_starts: int = 4, level:int = 1, opt:str = "least_squares", res_opt = 1,
         weighting: str = None, _y_idx = None, _x_idx = None):
         # weigthing: None | "uniform" | "inverse_distance2" | sigma
         
@@ -843,8 +843,10 @@ class SARProcessor:
         weights_vv_flat = weights_vv_window.ravel()
         
         # Mask to avoid nan
-        valid_mask = (np.isfinite(sigma0_vv_flat) & np.isfinite(theta_flat) & np.isfinite(weights_vv_flat) & (sigma0_vv_flat>0) & (sigma0_vv_flat <= 0.6)) # & np.isfinite(sigma0_vh_flat) & (sigma0_vv_flat <= 0.6)
-        # valid_mask = (np.isfinite(sigma0_vh_flat) & np.isfinite(theta_flat) & np.isfinite(weights_vv_flat) & (sigma0_vh_flat>0) & (sigma0_vh_flat <= 0.6))
+        if res_opt == 1:
+            valid_mask = (np.isfinite(sigma0_vv_flat) & np.isfinite(theta_flat) & np.isfinite(weights_vv_flat) & (sigma0_vv_flat>0) & (sigma0_vv_flat <= 0.6)) # & np.isfinite(sigma0_vh_flat) & (sigma0_vv_flat <= 0.6)
+        else:
+            valid_mask = (np.isfinite(sigma0_vh_flat) & np.isfinite(theta_flat) & np.isfinite(weights_vv_flat) & (sigma0_vh_flat>0) & (sigma0_vh_flat <= 0.6))
         sigma0_vv_flat = sigma0_vv_flat[valid_mask]
         sigma0_vh_flat = sigma0_vh_flat[valid_mask]
         theta_flat = theta_flat[valid_mask]
@@ -866,7 +868,7 @@ class SARProcessor:
                 result = least_squares(
                     scatter_residuals,
                     x0=[v0],
-                    args=(wdir, look_azimuth, theta_flat, sigma0_vv_flat, sigma0_vh_flat, weights_vv_flat),
+                    args=(wdir, look_azimuth, theta_flat, sigma0_vv_flat, sigma0_vh_flat, weights_vv_flat, res_opt),
                     bounds=([v_min], [v_max]),
                     loss=loss_methods.get(opt, "linear"),
                     f_scale=1.0,

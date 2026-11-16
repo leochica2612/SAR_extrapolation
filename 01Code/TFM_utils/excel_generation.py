@@ -113,11 +113,10 @@ def export_results_to_excel(
 
         sigma_expected = values.sigma_expected
         sigma_mean = values.sigma_sars_mean
-        sigma_sars = values.sigma_sars
 
         # Default values
-        sigma_p25 = np.nan
-        sigma_p75 = np.nan
+        sigma_p25 = values.sigma_vv_p25
+        sigma_p75 = values.sigma_vv_p75
         absolute_error = np.nan
         relative_error = np.nan
         flag = False
@@ -130,17 +129,14 @@ def export_results_to_excel(
                 relative_error = absolute_error / abs(sigma_mean)
 
         # Calculate percentiles from SAR sigma distribution
-        if sigma_sars is not None and len(sigma_sars) > 0:
-            sigma_p25 = np.percentile(sigma_sars, 25)
-            sigma_p75 = np.percentile(sigma_sars, 75)
-            if sigma_expected is not None:
-                if sigma_expected > sigma_p75:
-                    flag = True
-                    message = ("This tile can apparently be solved using the GMF S1IW.")
+        if sigma_expected is not None:
+            if sigma_expected > sigma_p75:
+                flag = True
+                message = ("This tile can apparently be solved using the GMF S1IW.")
 
-                elif sigma_expected < sigma_p25:
-                    flag = True
-                    message = ("Too much noise, a better filtering is needed.")
+            elif sigma_expected < sigma_p25:
+                flag = True
+                message = ("Too much noise, a better filtering is needed.")
 
         sigma_rows.append({
             "MAP NUMBER": values.map_number,

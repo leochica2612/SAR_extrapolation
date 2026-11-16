@@ -28,8 +28,8 @@ def stability_residuals(params,
 
     return res
 
-def scatter_residuals(params,
-    wdir, look_azimuth, theta, sigma0_vv, sigma0_vh, sqrt_weights):
+def scatter_residuals(params, 
+wdir, look_azimuth, theta, sigma0_vv, sigma0_vh, sqrt_weights, opt = 1):
     
     v = float(params[0])
     wind_to = (wdir + 180.0) % 360.0 # Normalize direction.
@@ -41,16 +41,17 @@ def scatter_residuals(params,
     def to_db(x):
         return 10.0 * np.log10(np.maximum(x, 1e-12))
 
-    # CMOD5-N
-    sigma0_pred = calc_sigma0_cmod5_n(v, phi_rel, theta) #Using empirical equation
-    # Guard against numerical problems.
-    sigma0_pred = np.asarray(sigma0_pred, dtype=np.float64)
-    sigma0_pred = np.maximum(sigma0_pred, 1e-12)
-    res_vv = sigma0_pred - sigma0_vv
-    
-    # S1IW.NR
-    # sigma0_pred2 = calc_sigma0_s1iw_nr(v, theta) #Using empirical equation
-    # sigma0_pred2 = np.maximum(sigma0_pred2, 1e-12)
-    # res_vv = to_db(sigma0_pred2) - to_db(sigma0_vh)
+    if opt == 1:
+        # CMOD5-N
+        sigma0_pred = calc_sigma0_cmod5_n(v, phi_rel, theta) #Using empirical equation
+        # Guard against numerical problems.
+        sigma0_pred = np.asarray(sigma0_pred, dtype=np.float64)
+        sigma0_pred = np.maximum(sigma0_pred, 1e-12)
+        res = sigma0_pred - sigma0_vv
+    else:
+        # S1IW.NR
+        sigma0_pred = calc_sigma0_s1iw_nr(v, theta) #Using empirical equation
+        sigma0_pred = np.maximum(sigma0_pred, 1e-12)
+        res = to_db(sigma0_pred) - to_db(sigma0_vh)
 
-    return np.concatenate([np.ravel(sqrt_weights*res_vv)]) #, np.ravel(0.1*sqrt_weights*res_vh)])
+    return np.concatenate([np.ravel(sqrt_weights*res)]) #, np.ravel(0.1*sqrt_weights*res_vh)])

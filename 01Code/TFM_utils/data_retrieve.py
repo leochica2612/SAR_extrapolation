@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from typing import Literal
 
 @dataclass
 class Data_Retrieved_per_file:
@@ -28,6 +29,11 @@ class Data_Retrieved_per_file:
     sigma_expected: float | None = None
     sigma_sars: list[float] | None = None
     sigma_sars_mean: float | None = None
+    sigma_vv_p75: float | None = None
+    sigma_vv_p25: float | None = None
+    
+    # Flag
+    flag: Literal["NONE", "S1WR", "NOISE"] = "NONE"
 
 
 @dataclass
