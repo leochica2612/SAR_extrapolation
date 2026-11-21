@@ -105,7 +105,7 @@ def return_weight(weighting, sigma_vv, sigma_vh, distance2):
     return np.sqrt(weights_vv_window)
 
 def return_bounds(z_ref: float = 60.0, scaled: bool = False):
-        low_level = 0.01
+        low_level = 0.1
         intermediate_level = 500.0
         upper_level = 3000.0
         

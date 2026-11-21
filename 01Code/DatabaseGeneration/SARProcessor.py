@@ -834,7 +834,7 @@ class SARProcessor:
 
         # Sentinel-1 is not right-looking.
         # For a right-looking SAR --> look azimuth = platform heading + 90°
-        look_azimuth = platform_heading % 360.0
+        look_azimuth = (platform_heading + 90.0) % 360.0
         
         #Flat values for residuals
         sigma0_vv_flat = sigma0_vv_window.ravel()

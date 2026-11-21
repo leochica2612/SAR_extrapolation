@@ -129,7 +129,7 @@ def export_results_to_excel(
                 relative_error = absolute_error / abs(sigma_mean)
 
         # Calculate percentiles from SAR sigma distribution
-        if sigma_expected is not None:
+        if sigma_expected is not None and sigma_p75 is not None and sigma_p25 is not None:
             if sigma_expected > sigma_p75:
                 flag = True
                 message = ("This tile can apparently be solved using the GMF S1IW.")

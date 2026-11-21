@@ -19,9 +19,9 @@ def return_stability(L):
             L_bounds = [500, 1000]
             stability = "n"
     elif L<0:
-        L_bounds = [-500,-1]
+        L_bounds = [-500,-0.01]
         stability = "u"
     elif L>0:
-        L_bounds = [1,500]
+        L_bounds = [0.01,500]
         stability = "s"
     return stability, L_bounds
